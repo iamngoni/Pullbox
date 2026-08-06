@@ -1,0 +1,27 @@
+services:
+  pullbox:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: pullbox:local
+    container_name: pullbox
+    environment:
+      PULLBOX_BIND: 0.0.0.0:8787
+      RUST_LOG: info
+    ports:
+      - "127.0.0.1:8787:8787"
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.pullbox.rule=Host(`pullbox.antonlabs.cc`)
+      - traefik.http.routers.pullbox.entrypoints=websecure
+      - traefik.http.routers.pullbox.tls=true
+      - traefik.http.services.pullbox.loadbalancer.server.port=8787
+      - traefik.docker.network=media-server_default
+    networks:
+      - media-server
+    restart: unless-stopped
+
+networks:
+  media-server:
+    name: media-server_default
+    external: true

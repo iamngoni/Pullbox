@@ -1,0 +1,6 @@
+.DS_Store
+Pullbox-source.zip
+backend/target/
+ios/PullboxCore/.build/
+**/xcuserdata/
+**/*.xcuserstate
