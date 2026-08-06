@@ -1,0 +1,53 @@
+name: Deploy production
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pullbox-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy and verify
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on:
+      - self-hosted
+      - linux
+      - gridops-ci
+    environment: production
+    timeout-minutes: 20
+    steps:
+      - name: Configure deployment key
+        env:
+          PULLBOX_DEPLOY_SSH_KEY: ${{ secrets.PULLBOX_DEPLOY_SSH_KEY }}
+        run: |
+          install -d -m 700 ~/.ssh
+          install -m 600 /dev/null ~/.ssh/pullbox_deploy
+          printf '%s\n' "$PULLBOX_DEPLOY_SSH_KEY" > ~/.ssh/pullbox_deploy
+
+      - name: Deploy main on the Mac mini
+        env:
+          PULLBOX_DEPLOY_HOST: ${{ secrets.PULLBOX_DEPLOY_HOST }}
+          PULLBOX_DEPLOY_PATH: ${{ secrets.PULLBOX_DEPLOY_PATH }}
+          PULLBOX_DEPLOY_USER: ${{ secrets.PULLBOX_DEPLOY_USER }}
+        run: |
+          ssh -i ~/.ssh/pullbox_deploy -o StrictHostKeyChecking=accept-new "$PULLBOX_DEPLOY_USER@$PULLBOX_DEPLOY_HOST" \
+            "cd '$PULLBOX_DEPLOY_PATH' && git fetch origin main && git checkout main && git reset --hard origin/main && docker compose up --detach --build --remove-orphans"
+
+      - name: Verify public deployment
+        run: |
+          curl --fail --silent --show-error --retry 12 --retry-delay 5 https://pullbox.antonlabs.cc/health
+
+      - name: Remove deployment key
+        if: always()
+        run: rm -f ~/.ssh/pullbox_deploy

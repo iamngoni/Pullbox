@@ -1,4 +1,5 @@
 .DS_Store
+excalidraw.log
 Pullbox-source.zip
 backend/target/
 ios/PullboxCore/.build/
