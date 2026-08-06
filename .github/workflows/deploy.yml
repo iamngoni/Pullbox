@@ -42,7 +42,7 @@ jobs:
           PULLBOX_DEPLOY_USER: ${{ secrets.PULLBOX_DEPLOY_USER }}
         run: |
           ssh -i ~/.ssh/pullbox_deploy -o StrictHostKeyChecking=accept-new "$PULLBOX_DEPLOY_USER@$PULLBOX_DEPLOY_HOST" \
-            "cd '$PULLBOX_DEPLOY_PATH' && git fetch origin main && git checkout main && git reset --hard origin/main && docker compose up --detach --build --remove-orphans"
+            "cd '$PULLBOX_DEPLOY_PATH' && git fetch origin main && git checkout main && git reset --hard origin/main && /usr/local/bin/docker compose up --detach --build --remove-orphans"
 
       - name: Verify public deployment
         run: |
