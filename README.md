@@ -83,3 +83,22 @@ cd .. && xcodebuild -project Pullbox.xcodeproj -scheme Pullbox -sdk iphonesimula
 ```
 
 Only download media that you own or are authorized to save. The backend does not bypass DRM, logins, paywalls, or access controls.
+
+## Private media (cookie jars)
+
+Pullbox can save age-restricted, followers-only, and login-walled posts from platforms you have a session for.
+
+1. In your desktop browser (logged into the platform), export cookies with a "Get cookies.txt LOCALLY" style extension — **Netscape format**.
+2. Save the file on the host as `~/Services/Pullbox/cookies/<platform>.txt`:
+
+| Platform | File name |
+|---|---|
+| Instagram | `instagram.txt` |
+| TikTok | `tiktok.txt` |
+| Twitter / X | `twitter.txt` |
+| Facebook | `facebook.txt` |
+| YouTube | `youtube.txt` |
+
+3. Restart: `docker compose -f ~/Services/Pullbox/compose.yaml restart pullbox`
+
+The `cookies/` dir is mounted read-only at `/cookies`; the backend passes `--cookies <platform>.txt` to yt-dlp whenever the URL matches that platform. Never commit these files — they contain live session tokens.
