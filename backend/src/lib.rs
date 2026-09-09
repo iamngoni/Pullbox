@@ -152,6 +152,7 @@ pub struct ErrorBody {
 
 pub fn configure(config: &mut web::ServiceConfig) {
     config
+        .app_data(web::JsonConfig::default().limit(16 * 1024))
         .route("/health", web::get().to(health))
         .route("/api/analyze", web::post().to(analyze))
         .route("/api/download", web::post().to(download))

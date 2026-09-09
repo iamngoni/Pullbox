@@ -248,7 +248,7 @@ public enum BackgroundDownloadHandoff {
         activityManager: LiveActivityControlling? = nil,
         baseURL: URL? = nil,
         clientID: String? = nil,
-        backgroundEnqueuer: BackgroundTransferEnqueuer? = nil
+        backgroundEnqueuer: BackgroundTransferEnqueuer
     ) async throws -> QueuedDownload {
         let targetStore = store ?? sharedStore
         let item = try targetStore.enqueue(sourceURL: sourceURL, id: id, title: title)
@@ -265,8 +265,7 @@ public enum BackgroundDownloadHandoff {
                 title: item.title,
                 clientID: resolvedClientID
             )
-            let enqueuer: BackgroundTransferEnqueuer = backgroundEnqueuer ?? SystemBackgroundTransferEnqueuer()
-            try enqueuer.enqueueBackgroundDownload(for: item, request: request)
+            try backgroundEnqueuer.enqueueBackgroundDownload(for: item, request: request)
         } catch {
             try? targetStore.remove(id: item.id)
             throw error
@@ -283,29 +282,4 @@ public enum BackgroundDownloadHandoff {
         return item
     }
 
-    /// Legacy sync handoff (kept for compatibility). Performs durable enqueue synchronously
-    /// and enqueues system-owned background transfer synchronously, but fires Live Activity
-    /// asynchronously. Prefer the async version in the share extension so the activity is
-    /// guaranteed before completeRequest.
-    @discardableResult
-    public static func enqueueAndNotify(sourceURL: URL, title: String? = nil, store: FileQueueStore? = nil, activityManager: LiveActivityControlling? = nil) throws -> QueuedDownload {
-        let targetStore = store ?? sharedStore
-        let item = try targetStore.enqueue(sourceURL: sourceURL, title: title)
-        // System-owned background transfer synchronously (best effort)
-        let base = resolveBaseURL()
-        if let request = try? APIRequestBuilder(baseURL: base).download(sourceURL: sourceURL) {
-            let enqueuer = SystemBackgroundTransferEnqueuer()
-            try? enqueuer.enqueueBackgroundDownload(for: item, request: request)
-        }
-        // Fire Live Activity asynchronously (legacy behavior)
-        if let manager = activityManager {
-            let captured = item
-            Task { [captured] in try? await manager.start(for: captured) }
-        } else {
-            let captured = item
-            Task { [captured] in try? await PullboxLiveActivityManager.shared.start(for: captured) }
-        }
-        NotificationCenter.default.post(name: .pullboxQueueUpdated, object: nil)
-        return item
-    }
 }

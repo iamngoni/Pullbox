@@ -14,6 +14,12 @@ fn device_tokens_require_nonempty_even_length_hex_and_redact_debug_output() {
 }
 
 #[test]
+fn device_tokens_reject_oversized_hex_payloads() {
+    let oversized = "aa".repeat(129);
+    assert!(DeviceToken::parse(&oversized).is_err());
+}
+
+#[test]
 fn registry_keys_start_tokens_by_client_and_update_tokens_by_request() {
     let registry = TokenRegistry::default();
     registry
@@ -120,4 +126,27 @@ fn persistent_registry_survives_restart_without_exposing_token_file() {
             0o600
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn persistent_registry_secures_an_existing_permissive_token_file() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("activity-tokens.json");
+    std::fs::write(&path, r#"{"push_to_start":{},"updates":{}}"#).expect("seed token file");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+        .expect("set permissive fixture mode");
+
+    let _registry = TokenRegistry::persistent(&path).expect("persistent registry");
+
+    assert_eq!(
+        std::fs::metadata(path)
+            .expect("token file metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
 }

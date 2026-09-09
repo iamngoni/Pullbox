@@ -23,7 +23,7 @@ public struct SystemShareDownloadQueue: ShareDownloadQueueing {
         baseURL: URL,
         store: FileQueueStore? = nil,
         activityManager: (any LiveActivityControlling)? = nil,
-        backgroundEnqueuer: any BackgroundTransferEnqueuer = SystemBackgroundTransferEnqueuer()
+        backgroundEnqueuer: any BackgroundTransferEnqueuer
     ) {
         self.baseURL = baseURL
         self.store = store

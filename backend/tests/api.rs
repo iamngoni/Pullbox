@@ -129,3 +129,28 @@ async fn registration_endpoints_reject_malformed_tokens_without_echoing_them() {
     assert!(registry.push_to_start("client-123").is_none());
     assert!(registry.update_token("client-123", "request-456").is_none());
 }
+
+#[actix_rt::test]
+async fn json_requests_above_sixteen_kib_are_rejected_before_deserialization() {
+    let registry = TokenRegistry::default();
+    let app = test::init_service(
+        App::new()
+            .app_data(web::Data::new(registry))
+            .configure(configure),
+    )
+    .await;
+    let payload = serde_json::json!({
+        "clientId": "client-oversized",
+        "token": "aa".repeat(9_000)
+    })
+    .to_string();
+    let request = test::TestRequest::post()
+        .uri("/api/live-activity/push-to-start-token")
+        .insert_header(("content-type", "application/json"))
+        .set_payload(payload)
+        .to_request();
+
+    let response = test::call_service(&app, request).await;
+
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}

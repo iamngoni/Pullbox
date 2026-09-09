@@ -139,24 +139,20 @@ public protocol BackgroundTransferEnqueuer: Sendable {
 }
 
 public final class SystemBackgroundTransferEnqueuer: BackgroundTransferEnqueuer, @unchecked Sendable {
-    let activeSession: URLSession?
+    let activeSession: URLSession
 
     public init(
         factory: DefaultBackgroundSessionFactory = DefaultBackgroundSessionFactory(),
         sessionIdentifier: String = BackgroundDownloadHandoff.backgroundSessionIdentifier,
-        delegate: PullboxBackgroundSessionDelegate? = nil
+        delegate: PullboxBackgroundSessionDelegate
     ) {
-        let retainedDelegate = delegate ?? PullboxBackgroundSessionDelegate()
         self.activeSession = factory.makeSession(
             identifier: sessionIdentifier,
-            delegate: retainedDelegate
+            delegate: delegate
         )
     }
 
     public func enqueueBackgroundDownload(for item: QueuedDownload, request: URLRequest) throws {
-        guard let activeSession else {
-            throw URLError(.backgroundSessionWasDisconnected)
-        }
         let task = activeSession.downloadTask(with: request)
         task.taskDescription = item.id.uuidString
         task.resume()

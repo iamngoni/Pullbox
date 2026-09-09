@@ -23,7 +23,9 @@ Endpoints:
 
 - `GET /health`
 - `POST /api/analyze` with `{ "url": "https://…" }`
-- `POST /api/download` with `{ "url": "https://…" }`
+- `POST /api/download` with `{ "url": "https://…", "requestId": "<UUID>", "title": "…", "clientId": "<UUID>" }`; the three metadata fields are optional for legacy callers but required for Live Activity updates
+- `POST /api/live-activity/push-to-start-token` with `{ "clientId": "<UUID>", "token": "<hex>" }`
+- `POST /api/live-activity/update-token` with `{ "clientId": "<UUID>", "requestId": "<UUID>", "token": "<hex>" }`
 
 Override the bind address with `PULLBOX_BIND`, for example:
 
@@ -62,6 +64,22 @@ docker compose up -d --build
 ```
 
 The container joins the existing `media-server_default` network and advertises `pullbox.antonlabs.cc` to Traefik. Cloudflared forwards that public hostname to Traefik. The API is intentionally unauthenticated during personal testing; do not advertise the endpoint or treat it as a multi-user service.
+
+### Live Activity APNs configuration
+
+The iPhone app registers an install-level push-to-start token and a per-download update token with the backend. The backend stores them in `PULLBOX_APNS_TOKEN_STORE_PATH`; Docker Compose mounts `/data/live-activity-tokens.json` from the persistent `pullbox-data` volume. The file is written atomically with owner-only (`0600`) permissions.
+
+APNs is disabled when none of the following variables are present. Supplying only some of them is a startup error:
+
+- `PULLBOX_APNS_TEAM_ID`
+- `PULLBOX_APNS_KEY_ID`
+- `PULLBOX_APNS_PRIVATE_KEY_PEM`
+- `PULLBOX_APNS_TOPIC` — use `dev.iamngoni.pullbox.push-type.liveactivity`
+- `PULLBOX_APNS_ENVIRONMENT` — `sandbox` for this development-signed device build, `production` for distribution builds
+
+Inject the `.p8` private-key contents through the deployment secret store. Never add the key or an environment file containing it to this repository. The backend reuses each ES256 provider JWT for 50 minutes instead of signing one per progress update.
+
+The server reports media preparation over `0–90%` and leaves the activity active once the response is ready. The iPhone owns `90–99%` for the background response transfer and ends at `100%` only after Photos confirms the save. A successful backend process is therefore never presented as a successful Photos save.
 
 ## Install on Ngonidzashe's iPhone
 

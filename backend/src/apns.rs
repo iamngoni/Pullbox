@@ -18,6 +18,8 @@ use std::{
 use thiserror::Error;
 use tokio::sync::Notify;
 
+const MAX_DEVICE_TOKEN_HEX_LENGTH: usize = 256;
+
 /// A validated APNs device token whose formatting never exposes its bytes.
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub struct DeviceToken(String);
@@ -26,6 +28,7 @@ impl DeviceToken {
     /// Parses the APNs hexadecimal wire representation.
     pub fn parse(value: &str) -> Result<Self, DeviceTokenError> {
         if value.is_empty()
+            || value.len() > MAX_DEVICE_TOKEN_HEX_LENGTH
             || !value.len().is_multiple_of(2)
             || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
         {
@@ -430,6 +433,11 @@ impl TokenRegistry {
             Err(error) if error.kind() == io::ErrorKind::NotFound => TokenMaps::default(),
             Err(error) => return Err(error.into()),
         };
+        #[cfg(unix)]
+        if path.exists() {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        }
         Ok(Self {
             inner: Arc::new(RwLock::new(maps)),
             storage_path: Some(Arc::new(path)),
@@ -494,7 +502,7 @@ impl TokenRegistry {
         &self,
         client_id: &str,
         request_id: &str,
-        maximum_wait: Duration,
+        wait: Duration,
     ) -> Option<DeviceToken> {
         if let Some(token) = self.update_token(client_id, request_id) {
             return Some(token);
@@ -505,8 +513,33 @@ impl TokenRegistry {
             return Some(token);
         }
 
-        let _ = actix_web::rt::time::timeout(maximum_wait, notified).await;
+        let _ = actix_web::rt::time::timeout(wait, notified).await;
         self.update_token(client_id, request_id)
+    }
+
+    /// Removes a per-download token after the backend's final use and persists the change.
+    pub fn remove_update(
+        &self,
+        client_id: &str,
+        request_id: &str,
+    ) -> Result<bool, TokenRegistryError> {
+        let mut maps = self.write();
+        let original = maps.clone();
+        let removed = maps
+            .updates
+            .get_mut(client_id)
+            .and_then(|requests| requests.remove(request_id))
+            .is_some();
+        if maps.updates.get(client_id).is_some_and(HashMap::is_empty) {
+            maps.updates.remove(client_id);
+        }
+        if removed {
+            if let Err(error) = self.persist(&maps) {
+                *maps = original;
+                return Err(error);
+            }
+        }
+        Ok(removed)
     }
 
     fn persist(&self, maps: &TokenMaps) -> Result<(), TokenRegistryError> {
@@ -670,6 +703,15 @@ impl ApnsActivityNotifier {
         self.client.send(&token, event, payload, timestamp).await?;
         Ok(NotificationOutcome::Accepted)
     }
+
+    fn release_update_token(&self, context: &ActivityNotificationContext) {
+        if let Err(error) = self
+            .registry
+            .remove_update(&context.client_id, &context.activity.request_id)
+        {
+            log::error!("Could not remove completed Live Activity token: {error}");
+        }
+    }
 }
 
 #[async_trait]
@@ -713,13 +755,16 @@ impl ActivityNotifier for ApnsActivityNotifier {
         context: &ActivityNotificationContext,
         timestamp: i64,
     ) -> Result<NotificationOutcome, ApnsSendError> {
-        self.send_update(
-            context,
-            ApnsEvent::Update,
-            build_server_ready_payload(&context.activity, timestamp),
-            timestamp,
-        )
-        .await
+        let result = self
+            .send_update(
+                context,
+                ApnsEvent::Update,
+                build_server_ready_payload(&context.activity, timestamp),
+                timestamp,
+            )
+            .await;
+        self.release_update_token(context);
+        result
     }
 
     async fn failed(
@@ -728,13 +773,16 @@ impl ActivityNotifier for ApnsActivityNotifier {
         message: &str,
         timestamp: i64,
     ) -> Result<NotificationOutcome, ApnsSendError> {
-        self.send_update(
-            context,
-            ApnsEvent::End,
-            build_failure_payload(&context.activity, timestamp, message),
-            timestamp,
-        )
-        .await
+        let result = self
+            .send_update(
+                context,
+                ApnsEvent::End,
+                build_failure_payload(&context.activity, timestamp, message),
+                timestamp,
+            )
+            .await;
+        self.release_update_token(context);
+        result
     }
 }
 

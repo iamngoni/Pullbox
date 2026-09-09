@@ -136,6 +136,43 @@ async fn activity_notifier_routes_start_updates_and_ready_to_the_right_tokens() 
         .to_string()
         .to_ascii_lowercase()
         .contains("saved"));
+    assert!(registry.update_token("client-123", "request-456").is_none());
+}
+
+#[actix_rt::test]
+async fn terminal_server_failure_releases_the_activity_update_token() {
+    let registry = TokenRegistry::default();
+    registry
+        .register_update(
+            "client-failed",
+            "request-failed",
+            DeviceToken::parse("11223344").unwrap(),
+        )
+        .unwrap();
+    let transport = Arc::new(FakeTransport {
+        requests: Mutex::new(Vec::new()),
+        status: 200,
+        reason: None,
+    });
+    let client = Arc::new(ApnsClient::new(test_config(), transport));
+    let notifier = ApnsActivityNotifier::new(registry.clone(), client);
+    let context = ActivityNotificationContext::new(
+        "client-failed",
+        "request-failed",
+        "Failed clip",
+        "https://example.com/video",
+    );
+
+    assert_eq!(
+        notifier
+            .failed(&context, "Download failed", 1_725_000_020)
+            .await
+            .unwrap(),
+        NotificationOutcome::Accepted
+    );
+    assert!(registry
+        .update_token("client-failed", "request-failed")
+        .is_none());
 }
 
 #[actix_rt::test]

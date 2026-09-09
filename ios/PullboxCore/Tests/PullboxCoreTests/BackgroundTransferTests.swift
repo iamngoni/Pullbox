@@ -145,9 +145,9 @@ import Testing
 
     try enqueuer.enqueueBackgroundDownload(for: item, request: URLRequest(url: requestURL))
 
-    #expect(enqueuer.activeSession?.configuration.identifier == identifier)
-    #expect(enqueuer.activeSession?.delegate === delegate)
-    enqueuer.activeSession?.invalidateAndCancel()
+    #expect(enqueuer.activeSession.configuration.identifier == identifier)
+    #expect(enqueuer.activeSession.delegate === delegate)
+    enqueuer.activeSession.invalidateAndCancel()
 }
 
 @Test func unconfiguredPhotoSaverThrowsInsteadOfReportingFalseSuccess() async throws {

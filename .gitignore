@@ -6,3 +6,7 @@ ios/PullboxCore/.build/
 **/xcuserdata/
 **/*.xcuserstate
 cookies/
+.env
+.env.*
+*.p8
+data/
