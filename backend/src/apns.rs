@@ -22,6 +22,7 @@ use url::Url;
 const MAX_DEVICE_TOKEN_HEX_LENGTH: usize = 256;
 const MAX_ACTIVITY_TITLE_CHARACTERS: usize = 160;
 const MAX_ACTIVITY_SOURCE_URL_BYTES: usize = 1_024;
+const MAX_APNS_PAYLOAD_BYTES: usize = 4 * 1_024;
 pub const TERMINAL_TOMBSTONE_TTL_SECONDS: i64 = 24 * 60 * 60;
 
 /// A validated APNs device token whose formatting never exposes its bytes.
@@ -167,6 +168,15 @@ impl ApnsConfig {
         body: Value,
         issued_at: i64,
     ) -> Result<PreparedApnsRequest, ApnsRequestError> {
+        let payload_size = serde_json::to_vec(&body)
+            .map_err(ApnsRequestError::Serialization)?
+            .len();
+        if payload_size > MAX_APNS_PAYLOAD_BYTES {
+            return Err(ApnsRequestError::PayloadTooLarge {
+                actual: payload_size,
+                maximum: MAX_APNS_PAYLOAD_BYTES,
+            });
+        }
         let jwt = self.provider_token(issued_at)?;
         let headers = HashMap::from([
             ("authorization".to_string(), format!("bearer {jwt}")),
@@ -387,6 +397,10 @@ pub enum ApnsSendError {
 /// APNs request construction failed before any network call.
 #[derive(Debug, Error)]
 pub enum ApnsRequestError {
+    #[error("could not serialize APNs payload")]
+    Serialization(#[source] serde_json::Error),
+    #[error("APNs payload is {actual} bytes; maximum is {maximum}")]
+    PayloadTooLarge { actual: usize, maximum: usize },
     #[error("could not create APNs ES256 authentication token")]
     Signing(#[source] jsonwebtoken::errors::Error),
 }
@@ -1035,6 +1049,10 @@ fn bounded_activity_source_url(source_url: &str) -> String {
     if source_url.len() <= MAX_ACTIVITY_SOURCE_URL_BYTES {
         return source_url.to_owned();
     }
+    activity_source_origin(source_url)
+}
+
+fn activity_source_origin(source_url: &str) -> String {
     Url::parse(source_url)
         .ok()
         .filter(|url| matches!(url.scheme(), "http" | "https"))
@@ -1045,6 +1063,28 @@ fn bounded_activity_source_url(source_url: &str) -> String {
 
 /// Builds an iOS 18+ push-to-start payload for Pullbox's ActivityKit schema.
 pub fn build_start_payload(activity: &ActivityDescriptor, timestamp: i64) -> Value {
+    let payload = build_start_payload_value(activity, timestamp);
+    if serialized_payload_fits(&payload) {
+        return payload;
+    }
+
+    let mut bounded = activity.clone();
+    bounded.source_url = activity_source_origin(&bounded.source_url);
+    let mut payload = build_start_payload_value(&bounded, timestamp);
+    while !serialized_payload_fits(&payload) && !bounded.title.is_empty() {
+        bounded.title.pop();
+        payload = build_start_payload_value(&bounded, timestamp);
+    }
+    payload
+}
+
+fn serialized_payload_fits(payload: &Value) -> bool {
+    serde_json::to_vec(payload)
+        .map(|bytes| bytes.len() <= 4 * 1024)
+        .unwrap_or(false)
+}
+
+fn build_start_payload_value(activity: &ActivityDescriptor, timestamp: i64) -> Value {
     json!({
         "aps": {
             "timestamp": timestamp,

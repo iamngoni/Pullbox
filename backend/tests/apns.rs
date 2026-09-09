@@ -72,6 +72,26 @@ fn start_payload_bounds_display_metadata_without_changing_request_identity() {
 }
 
 #[test]
+fn start_payload_enforces_the_serialized_apns_byte_limit() {
+    let source_url = format!("https://example.com/?q={}", "\\".repeat(990));
+    assert_eq!(source_url.len(), 1_013);
+    let activity = ActivityDescriptor::new(
+        "734B31C0-6CD7-47FB-B769-A03B73C468D2",
+        "\u{0001}".repeat(160),
+        source_url,
+    );
+
+    let encoded =
+        serde_json::to_vec(&build_start_payload(&activity, 1_725_000_000)).expect("encode payload");
+
+    assert!(
+        encoded.len() <= 4 * 1024,
+        "payload was {} bytes",
+        encoded.len()
+    );
+}
+
+#[test]
 fn update_payload_reports_fractional_server_download_progress() {
     let activity =
         ActivityDescriptor::new("request-123", "Example clip", "https://example.com/video");
@@ -251,4 +271,32 @@ fn prepared_apns_request_has_activitykit_headers_and_es256_auth() {
         .prepare_request(&device_token, ApnsEvent::End, json!({}), 1_725_000_002)
         .expect("end request");
     assert_eq!(end.headers["apns-priority"], "10");
+}
+
+#[test]
+fn apns_request_preparation_rejects_serialized_bodies_over_four_kib() {
+    let secret = p256::SecretKey::from_slice(&[9_u8; 32]).expect("test P-256 key");
+    let private_key = secret
+        .to_pkcs8_pem(LineEnding::LF)
+        .expect("test PKCS#8 PEM")
+        .to_string();
+    let config = ApnsConfig::from_values(
+        Some("TEAM123".to_string()),
+        Some("KEY123".to_string()),
+        Some(private_key),
+        None,
+        Some("sandbox".to_string()),
+    )
+    .expect("valid config")
+    .expect("enabled config");
+    let device_token = DeviceToken::parse("aabbccdd").expect("valid test token");
+
+    let result = config.prepare_request(
+        &device_token,
+        ApnsEvent::Start,
+        json!({"aps": {"content-state": {"title": "x".repeat(5_000)}}}),
+        1_725_000_000,
+    );
+
+    assert!(result.is_err(), "oversized payload reached APNs transport");
 }
