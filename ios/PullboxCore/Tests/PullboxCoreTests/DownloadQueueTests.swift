@@ -8,23 +8,36 @@ import Testing
     let tmp = FileManager.default.temporaryDirectory
         .appending(path: "pullbox-test-\(UUID().uuidString).json")
     defer { try? FileManager.default.removeItem(at: tmp) }
-    let store = try #require(FileQueueStore(fileURL: tmp))
+    let store = FileQueueStore(fileURL: tmp)
     let url = try #require(URL(string: "https://example.com/video"))
     let item = try store.enqueue(sourceURL: url)
     #expect(item.sourceURL == url)
     #expect(item.status == .queued)
     // Durable: reload from new store instance reads back
-    let store2 = try #require(FileQueueStore(fileURL: tmp))
+    let store2 = FileQueueStore(fileURL: tmp)
     let items = try store2.load()
     #expect(items.count == 1)
     #expect(items[0].id == item.id)
+}
+
+@Test func enqueuePersistsTitleInTheInitialAtomicWrite() throws {
+    let tmp = FileManager.default.temporaryDirectory
+        .appending(path: "pullbox-titled-\(UUID().uuidString).json")
+    defer { try? FileManager.default.removeItem(at: tmp) }
+    let store = FileQueueStore(fileURL: tmp)
+    let url = try #require(URL(string: "https://example.com/video"))
+
+    let item = try store.enqueue(sourceURL: url, title: "Resolved title")
+
+    #expect(item.title == "Resolved title")
+    #expect(try store.load().first?.title == "Resolved title")
 }
 
 @Test func enqueueInvalidSchemeThrowsAndDoesNotPersist() throws {
     let tmp = FileManager.default.temporaryDirectory
         .appending(path: "pullbox-test-\(UUID().uuidString).json")
     defer { try? FileManager.default.removeItem(at: tmp) }
-    let store = try #require(FileQueueStore(fileURL: tmp))
+    let store = FileQueueStore(fileURL: tmp)
     let bad = try #require(URL(string: "file:///etc/passwd"))
     #expect(throws: (any Error).self) {
         _ = try store.enqueue(sourceURL: bad)
@@ -37,14 +50,29 @@ import Testing
     let tmp = FileManager.default.temporaryDirectory
         .appending(path: "pullbox-test-\(UUID().uuidString).json")
     defer { try? FileManager.default.removeItem(at: tmp) }
-    let store = try #require(FileQueueStore(fileURL: tmp))
+    let store = FileQueueStore(fileURL: tmp)
     for i in 0..<3 {
         let url = try #require(URL(string: "https://example.com/video\(i)"))
         _ = try store.enqueue(sourceURL: url)
     }
-    let store2 = try #require(FileQueueStore(fileURL: tmp))
+    let store2 = FileQueueStore(fileURL: tmp)
     let items = try store2.load()
     #expect(items.count == 3)
+}
+
+@Test func concurrentEnqueuesPreserveEveryQueuedDownload() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appending(path: "pullbox-concurrent-\(UUID().uuidString)", directoryHint: .isDirectory)
+    let queueFile = root.appending(path: "queue.json")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = FileQueueStore(fileURL: queueFile)
+
+    DispatchQueue.concurrentPerform(iterations: 20) { index in
+        let url = URL(string: "https://example.com/video-\(index)")!
+        _ = try? store.enqueue(sourceURL: url)
+    }
+
+    #expect(try store.load().count == 20)
 }
 
 @Test func enqueueFailureDoesNotFalselyReportSuccess() throws {
@@ -97,6 +125,29 @@ import Testing
     #expect(decoded == item)
 }
 
+@Test func activeDownloadProgressNeverMovesBackward() throws {
+    let tmp = FileManager.default.temporaryDirectory
+        .appending(path: "pullbox-progress-\(UUID().uuidString).json")
+    defer { try? FileManager.default.removeItem(at: tmp) }
+    let store = FileQueueStore(fileURL: tmp)
+    let url = try #require(URL(string: "https://example.com/video"))
+    let item = try store.enqueue(sourceURL: url)
+
+    _ = try store.updateProgressIfActive(id: item.id, progress: 0.7)
+    let updated = try store.updateProgressIfActive(id: item.id, progress: 0.3)
+
+    #expect(updated?.status == .downloading(progress: 0.7))
+    #expect(try store.load().first?.status == .downloading(progress: 0.7))
+}
+
+@Test func deviceTransferProgressUsesOnlyTheFinalTenPercent() {
+    #expect(abs(DownloadProgressScale.deviceTransfer(rawProgress: 0) - 0.9) < 0.000_001)
+    #expect(abs(DownloadProgressScale.deviceTransfer(rawProgress: 0.5) - 0.945) < 0.000_001)
+    #expect(abs(DownloadProgressScale.deviceTransfer(rawProgress: 1) - 0.99) < 0.000_001)
+    #expect(abs(DownloadProgressScale.deviceTransfer(rawProgress: -1) - 0.9) < 0.000_001)
+    #expect(abs(DownloadProgressScale.deviceTransfer(rawProgress: 2) - 0.99) < 0.000_001)
+}
+
 // MARK: - Share URL extraction (extension-safe)
 
 @Test func shareURLExtractorFindsWebURLInText() throws {
@@ -145,4 +196,8 @@ import Testing
     #expect(DownloadStatus.saving.liveActivityStatus == .saving)
     #expect(DownloadStatus.succeeded.liveActivityStatus == .succeeded)
     #expect(DownloadStatus.failed("x").liveActivityStatus == .failed)
+}
+
+@Test func terminalLiveActivityStateRemainsVisibleLongEnoughToRead() {
+    #expect(LiveActivityPresentationPolicy.terminalVisibilityDuration >= 30)
 }

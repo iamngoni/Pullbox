@@ -45,22 +45,18 @@ struct ContentView: View {
         .onAppear {
             syncServerURLToAppGroup()
             reloadQueue()
-            processQueueIfNeeded()
-            // Observe queue updates from share extension
-            NotificationCenter.default.addObserver(forName: .pullboxQueueUpdated, object: nil, queue: .main) { _ in
-                reloadQueue()
-                processQueueIfNeeded()
-            }
-            NotificationCenter.default.addObserver(forName: .pullboxDownloadProgress, object: nil, queue: .main) { _ in
-                reloadQueue()
-            }
         }
-        .onChange(of: serverURL) { _ in
+        .onReceive(NotificationCenter.default.publisher(for: .pullboxQueueUpdated)) { _ in
+            reloadQueue()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .pullboxDownloadProgress)) { _ in
+            reloadQueue()
+        }
+        .onChange(of: serverURL) {
             syncServerURLToAppGroup()
         }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
             reloadQueue()
-            processQueueIfNeeded()
         }
     }
 
@@ -519,26 +515,15 @@ struct ContentView: View {
         queuedItems = (try? store.load()) ?? []
         // Sort: queued first, then by createdAt descending
         queuedItems.sort { a, b in
-            let order: [DownloadStatus: Int] = [.queued: 0, .preparing: 1, .downloading(progress: nil): 2, .saving: 3, .failed(""): 4, .succeeded: 5]
-            // Simplified: queued before succeeded
+            // Keep active work above completed downloads, newest first within each group.
             if a.status == .succeeded && b.status != .succeeded { return false }
             if b.status == .succeeded && a.status != .succeeded { return true }
             return a.createdAt > b.createdAt
         }
     }
-
-    private func processQueueIfNeeded() {
-        Task {
-            guard let baseURL = URL(string: serverURL), ["http","https"].contains(baseURL.scheme?.lowercased() ?? "") else { return }
-            let store = FileQueueStore(appGroupIdentifier: BackgroundDownloadHandoff.appGroupIdentifier)
-            let processor = DownloadQueueProcessor(store: store, photoSaver: AppPhotoSaver())
-            await processor.processNextIfNeeded(baseURL: baseURL)
-            reloadQueue()
-        }
-    }
 }
 
-private struct AppPhotoSaver: PhotoLibrarySaving {
+struct AppPhotoSaver: PhotoLibrarySaving {
     func save(at url: URL) async throws {
         try await PhotoSaver.save(at: url)
     }
@@ -599,7 +584,7 @@ private enum AppError: LocalizedError {
     }
 }
 
-private enum PhotoSaver {
+enum PhotoSaver {
     static func saveVideo(at url: URL) async throws {
         try await save(at: url)
     }

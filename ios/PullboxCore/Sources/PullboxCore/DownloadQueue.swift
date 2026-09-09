@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#endif
 
 // MARK: - DownloadStatus
 
@@ -9,6 +12,16 @@ public enum LiveActivityStatus: String, Codable, Sendable, Equatable, Hashable {
     case saving
     case succeeded
     case failed
+}
+
+public enum DownloadProgressScale {
+    public static let serverUpperBound = 0.9
+    public static let deviceTransferUpperBound = 0.99
+
+    public static func deviceTransfer(rawProgress: Double) -> Double {
+        let bounded = min(max(rawProgress, 0), 1)
+        return serverUpperBound + bounded * (deviceTransferUpperBound - serverUpperBound)
+    }
 }
 
 public enum DownloadStatus: Codable, Sendable, Equatable, Hashable {
@@ -117,6 +130,24 @@ public enum QueueError: LocalizedError, Equatable {
     }
 }
 
+private final class FileQueueLockRegistry: @unchecked Sendable {
+    static let shared = FileQueueLockRegistry()
+
+    private let registryLock = NSLock()
+    private var locks: [String: NSLock] = [:]
+
+    func lock(for path: String) -> NSLock {
+        registryLock.withLock {
+            if let existing = locks[path] {
+                return existing
+            }
+            let created = NSLock()
+            locks[path] = created
+            return created
+        }
+    }
+}
+
 public struct FileQueueStore: Sendable {
     public let fileURL: URL
 
@@ -136,14 +167,95 @@ public struct FileQueueStore: Sendable {
     }
 
     public func load() throws -> [QueuedDownload] {
+        try withExclusiveLock {
+            try loadUnlocked()
+        }
+    }
+
+    public func save(_ items: [QueuedDownload]) throws {
+        try withExclusiveLock {
+            try saveUnlocked(items)
+        }
+    }
+
+    @discardableResult
+    public func enqueue(sourceURL: URL, id: UUID = UUID(), title: String? = nil) throws -> QueuedDownload {
+        guard let scheme = sourceURL.scheme?.lowercased(), ["http", "https"].contains(scheme) else {
+            throw QueueError.invalidURL
+        }
+
+        return try withExclusiveLock {
+            var items = try loadUnlocked()
+            let item = QueuedDownload(id: id, sourceURL: sourceURL, status: .queued, title: title)
+            items.append(item)
+            try saveUnlocked(items)
+            return item
+        }
+    }
+
+    public func update(id: UUID, status: DownloadStatus) throws {
+        try withExclusiveLock {
+            var items = try loadUnlocked()
+            guard let index = items.firstIndex(where: { $0.id == id }) else { return }
+            items[index].status = status
+            try saveUnlocked(items)
+        }
+    }
+
+    public func updateTitle(id: UUID, title: String) throws {
+        try withExclusiveLock {
+            var items = try loadUnlocked()
+            guard let index = items.firstIndex(where: { $0.id == id }) else { return }
+            items[index].title = title
+            try saveUnlocked(items)
+        }
+    }
+
+    /// Records progress only while the transfer is still active. This prevents a
+    /// delayed URLSession progress callback from reopening a saving or terminal item.
+    @discardableResult
+    public func updateProgressIfActive(id: UUID, progress: Double) throws -> QueuedDownload? {
+        try withExclusiveLock {
+            var items = try loadUnlocked()
+            guard let index = items.firstIndex(where: { $0.id == id }) else { return nil }
+            let boundedProgress = min(max(progress, 0), 1)
+            switch items[index].status {
+            case .queued, .preparing:
+                items[index].status = .downloading(progress: boundedProgress)
+                try saveUnlocked(items)
+                return items[index]
+            case .downloading(let existingProgress):
+                let monotonicProgress = max(existingProgress ?? 0, boundedProgress)
+                items[index].status = .downloading(progress: monotonicProgress)
+                try saveUnlocked(items)
+                return items[index]
+            case .saving, .succeeded, .failed:
+                return nil
+            }
+        }
+    }
+
+    public func remove(id: UUID) throws {
+        try withExclusiveLock {
+            var items = try loadUnlocked()
+            items.removeAll { $0.id == id }
+            try saveUnlocked(items)
+        }
+    }
+
+    public func allItems() throws -> [QueuedDownload] {
+        try load()
+    }
+
+    private func loadUnlocked() throws -> [QueuedDownload] {
         guard FileManager.default.fileExists(atPath: fileURL.path) else {
             return []
         }
-        // If fileURL is a directory, reading will fail -> throw to indicate failure (so enqueue can surface error)
-        var isDir: ObjCBool = false
-        if FileManager.default.fileExists(atPath: fileURL.path, isDirectory: &isDir), isDir.boolValue {
+        var isDirectory: ObjCBool = false
+        if FileManager.default.fileExists(atPath: fileURL.path, isDirectory: &isDirectory), isDirectory.boolValue {
             throw QueueError.persistenceFailed("queue path is a directory")
         }
+
         do {
             let data = try Data(contentsOf: fileURL)
             if data.isEmpty { return [] }
@@ -153,54 +265,52 @@ public struct FileQueueStore: Sendable {
         } catch let error as QueueError {
             throw error
         } catch {
-            // Corrupted file -> treat as empty but log? For now throw persistenceFailed so caller knows
-            // However load should be forgiving in production; but for test that uses directory we need throw.
-            // Check if file is directory already handled; for other errors, try to return empty if decode fails due to empty?
             throw QueueError.persistenceFailed(error.localizedDescription)
         }
     }
 
-    public func save(_ items: [QueuedDownload]) throws {
+    private func saveUnlocked(_ items: [QueuedDownload]) throws {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.sortedKeys]
         let data = try encoder.encode(items)
-        let dir = fileURL.deletingLastPathComponent()
+        let directory = fileURL.deletingLastPathComponent()
+
         do {
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             try data.write(to: fileURL, options: [.atomic])
         } catch {
             throw QueueError.persistenceFailed(error.localizedDescription)
         }
     }
 
-    @discardableResult
-    public func enqueue(sourceURL: URL) throws -> QueuedDownload {
-        guard let scheme = sourceURL.scheme?.lowercased(), ["http", "https"].contains(scheme) else {
-            throw QueueError.invalidURL
+    private func withExclusiveLock<T>(_ operation: () throws -> T) throws -> T {
+        let directory = fileURL.deletingLastPathComponent()
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        } catch {
+            throw QueueError.persistenceFailed(error.localizedDescription)
         }
-        var items = try load()
-        let item = QueuedDownload(sourceURL: sourceURL, status: .queued)
-        items.append(item)
-        try save(items)
-        return item
-    }
 
-    public func update(id: UUID, status: DownloadStatus) throws {
-        var items = try load()
-        guard let idx = items.firstIndex(where: { $0.id == id }) else { return }
-        items[idx].status = status
-        try save(items)
-    }
+        let inProcessLock = FileQueueLockRegistry.shared.lock(for: fileURL.standardizedFileURL.path)
+        inProcessLock.lock()
+        defer { inProcessLock.unlock() }
 
-    public func remove(id: UUID) throws {
-        var items = try load()
-        items.removeAll { $0.id == id }
-        try save(items)
-    }
+        #if canImport(Darwin)
+        let lockURL = fileURL.appendingPathExtension("lock")
+        let descriptor = Darwin.open(lockURL.path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
+        guard descriptor >= 0 else {
+            throw QueueError.persistenceFailed(String(cString: strerror(errno)))
+        }
+        defer { _ = Darwin.close(descriptor) }
 
-    public func allItems() throws -> [QueuedDownload] {
-        try load()
+        guard Darwin.lockf(descriptor, F_LOCK, 0) == 0 else {
+            throw QueueError.persistenceFailed(String(cString: strerror(errno)))
+        }
+        defer { _ = Darwin.lockf(descriptor, F_ULOCK, 0) }
+        #endif
+
+        return try operation()
     }
 }
 

@@ -1,4 +1,4 @@
-use pullbox_backend::{choose_format, public_media_error, validate_http_url};
+use pullbox_backend::{choose_format, public_media_error, validate_http_url, DownloadRequest};
 
 #[test]
 fn accepts_public_http_and_https_urls() {
@@ -55,4 +55,60 @@ fn unknown_extractor_error_uses_safe_fallback() {
         public_media_error("ERROR: extractor internals", "Could not analyze"),
         "Could not analyze"
     );
+}
+
+#[test]
+fn download_request_accepts_new_camel_case_metadata() {
+    let request: DownloadRequest = serde_json::from_value(serde_json::json!({
+        "url": "https://example.com/video",
+        "requestId": "request-123",
+        "title": "Example clip",
+        "clientId": "client-456"
+    }))
+    .expect("extended request");
+
+    assert_eq!(request.request_id.as_deref(), Some("request-123"));
+    assert_eq!(request.title.as_deref(), Some("Example clip"));
+    assert_eq!(request.client_id.as_deref(), Some("client-456"));
+}
+
+#[test]
+fn download_request_remains_compatible_with_url_only_callers() {
+    let request: DownloadRequest = serde_json::from_value(serde_json::json!({
+        "url": "https://example.com/video"
+    }))
+    .expect("legacy request");
+
+    assert_eq!(request.url, "https://example.com/video");
+    assert!(request.format_id.is_none());
+    assert!(request.request_id.is_none());
+    assert!(request.title.is_none());
+    assert!(request.client_id.is_none());
+}
+
+#[test]
+fn notification_context_requires_all_download_metadata() {
+    let complete: DownloadRequest = serde_json::from_value(serde_json::json!({
+        "url": "https://example.com/video",
+        "requestId": "request-123",
+        "title": "Example clip",
+        "clientId": "client-456"
+    }))
+    .unwrap();
+    let parsed_url = validate_http_url(&complete.url).unwrap();
+    let context = complete
+        .activity_context(&parsed_url)
+        .expect("complete metadata");
+    assert_eq!(context.client_id(), "client-456");
+    assert_eq!(context.request_id(), "request-123");
+    assert_eq!(context.title(), "Example clip");
+    assert_eq!(context.source_url(), "https://example.com/video");
+
+    let missing: DownloadRequest = serde_json::from_value(serde_json::json!({
+        "url": "https://example.com/video",
+        "requestId": "request-123",
+        "clientId": "client-456"
+    }))
+    .unwrap();
+    assert!(missing.activity_context(&parsed_url).is_none());
 }

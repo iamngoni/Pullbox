@@ -58,6 +58,11 @@ public struct PullboxDownloadAttributes: Codable, Sendable, Equatable, Hashable 
 extension PullboxDownloadAttributes: ActivityAttributes {}
 #endif
 
+public enum LiveActivityPresentationPolicy {
+    /// Leaves the final Saved/Failed state on screen long enough for the user to read it.
+    public static let terminalVisibilityDuration: TimeInterval = 30
+}
+
 // MARK: - Live Activity Manager Protocol (for testability)
 
 public protocol LiveActivityControlling: Sendable {
@@ -82,6 +87,13 @@ public actor PullboxLiveActivityManager: LiveActivityControlling {
 
         #if canImport(ActivityKit) && os(iOS)
         if #available(iOS 16.1, *) {
+            if let existing = Activity<PullboxDownloadAttributes>.activities.first(where: {
+                $0.attributes.id == item.id.uuidString
+            }) {
+                activeIDs.insert(item.id.uuidString)
+                await existing.update(ActivityContent(state: state, staleDate: nil))
+                return
+            }
             if ActivityAuthorizationInfo().areActivitiesEnabled {
                 do {
                     _ = try Activity<PullboxDownloadAttributes>.request(
@@ -140,7 +152,14 @@ public actor PullboxLiveActivityManager: LiveActivityControlling {
         #if canImport(ActivityKit) && os(iOS)
         if #available(iOS 16.1, *) {
             for activity in Activity<PullboxDownloadAttributes>.activities where activity.attributes.id == item.id.uuidString {
-                let dismissal: ActivityUIDismissalPolicy = (liveStatus == .succeeded || liveStatus == .failed) ? .immediate : .default
+                let dismissal: ActivityUIDismissalPolicy
+                if liveStatus == .succeeded || liveStatus == .failed {
+                    dismissal = .after(
+                        Date().addingTimeInterval(LiveActivityPresentationPolicy.terminalVisibilityDuration)
+                    )
+                } else {
+                    dismissal = .default
+                }
                 await activity.end(ActivityContent(state: state, staleDate: nil), dismissalPolicy: dismissal)
                 activeIDs.remove(item.id.uuidString)
                 await postNotification(for: item, state: state)
@@ -195,6 +214,11 @@ public enum BackgroundDownloadHandoff {
         FileQueueStore(appGroupIdentifier: appGroupIdentifier, filename: queueFilename)
     }
 
+    public static var stagingDirectory: URL {
+        sharedStore.fileURL.deletingLastPathComponent()
+            .appending(path: "background-downloads", directoryHint: .isDirectory)
+    }
+
     public static func resolveBaseURL() -> URL {
         // Prefer App Group shared defaults (written by main app), then standard, then fallback
         if let suite = UserDefaults(suiteName: appGroupIdentifier),
@@ -211,43 +235,49 @@ public enum BackgroundDownloadHandoff {
         return URL(string: "https://pullbox.antonlabs.cc")!
     }
 
-    /// Async handoff for share extension: durable enqueue + system-owned background URLSession transfer
-    /// + Live Activity requested BEFORE returning (caller must await before completeRequest).
+    /// Async handoff for the share extension: durably enqueue, create/resume the
+    /// system-owned background transfer, persist preparing, and return. A local
+    /// ActivityKit surface is opt-in; the normal share path uses APNs push-to-start.
     /// Throws without persisting on invalid URL or persistence failure.
     @discardableResult
     public static func enqueueAndNotify(
+        id: UUID = UUID(),
         sourceURL: URL,
         title: String? = nil,
         store: FileQueueStore? = nil,
         activityManager: LiveActivityControlling? = nil,
         baseURL: URL? = nil,
+        clientID: String? = nil,
         backgroundEnqueuer: BackgroundTransferEnqueuer? = nil
     ) async throws -> QueuedDownload {
         let targetStore = store ?? sharedStore
-        var item = try targetStore.enqueue(sourceURL: sourceURL)
-        if let title {
-            var items = (try? targetStore.load()) ?? []
-            if let idx = items.firstIndex(where: { $0.id == item.id }) {
-                items[idx].title = title
-                try? targetStore.save(items)
-                item.title = title
-            }
-        }
+        let item = try targetStore.enqueue(sourceURL: sourceURL, id: id, title: title)
 
-        // System-owned background transfer: synchronously create and resume task before returning
+        // System-owned background transfer: synchronously create and resume task before returning.
+        // If this handoff fails, remove the queue record so the extension never reports a
+        // download as queued when no process owns the transfer.
         let resolvedBase = baseURL ?? resolveBaseURL()
+        let resolvedClientID = clientID ?? PullboxClientIdentityStore().clientID()
         do {
-            let request = try APIRequestBuilder(baseURL: resolvedBase).download(sourceURL: sourceURL)
+            let request = try APIRequestBuilder(baseURL: resolvedBase).download(
+                sourceURL: sourceURL,
+                requestID: item.id,
+                title: item.title,
+                clientID: resolvedClientID
+            )
             let enqueuer: BackgroundTransferEnqueuer = backgroundEnqueuer ?? SystemBackgroundTransferEnqueuer()
             try enqueuer.enqueueBackgroundDownload(for: item, request: request)
         } catch {
-            // Background task creation failure is non-fatal for durable handoff;
-            // containing app will retry via queue processor. Log and continue.
+            try? targetStore.remove(id: item.id)
+            throw error
         }
 
-        // Live Activity: await before returning so extension guarantees visible surface before teardown
-        let manager = activityManager ?? PullboxLiveActivityManager.shared
-        try? await manager.start(for: item)
+        // Persist the accepted transfer state before any optional presentation work.
+        try? targetStore.update(id: item.id, status: .preparing)
+        if let manager = activityManager {
+            try? await manager.start(for: item)
+            await manager.update(for: item, status: .preparing, progress: nil, title: item.title)
+        }
 
         NotificationCenter.default.post(name: .pullboxQueueUpdated, object: nil)
         return item
@@ -260,16 +290,7 @@ public enum BackgroundDownloadHandoff {
     @discardableResult
     public static func enqueueAndNotify(sourceURL: URL, title: String? = nil, store: FileQueueStore? = nil, activityManager: LiveActivityControlling? = nil) throws -> QueuedDownload {
         let targetStore = store ?? sharedStore
-        var item = try targetStore.enqueue(sourceURL: sourceURL)
-        if let title {
-            // Update title if provided
-            var items = (try? targetStore.load()) ?? []
-            if let idx = items.firstIndex(where: { $0.id == item.id }) {
-                items[idx].title = title
-                try? targetStore.save(items)
-                item.title = title
-            }
-        }
+        let item = try targetStore.enqueue(sourceURL: sourceURL, title: title)
         // System-owned background transfer synchronously (best effort)
         let base = resolveBaseURL()
         if let request = try? APIRequestBuilder(baseURL: base).download(sourceURL: sourceURL) {

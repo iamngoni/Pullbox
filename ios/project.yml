@@ -16,6 +16,8 @@ targets:
       - package: PullboxCore
       - target: PullboxShareExtension
         embed: true
+      - target: PullboxLiveActivity
+        embed: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.iamngoni.pullbox
@@ -42,8 +44,13 @@ targets:
     entitlements:
       path: Pullbox/Pullbox.entitlements
       properties:
+        aps-environment: development
         com.apple.security.application-groups:
           - group.dev.iamngoni.pullbox
+    attributes:
+      SystemCapabilities:
+        com.apple.Push:
+          enabled: 1
     info:
       path: Pullbox/Info.plist
       properties:

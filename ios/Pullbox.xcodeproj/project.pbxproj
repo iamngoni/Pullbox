@@ -12,6 +12,7 @@
 		3AFE8F43B11BD6A2CD5F20A6 /* PullboxBundle.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2FB8BBFE7E4B30328B722170 /* PullboxBundle.swift */; };
 		46338CC05C4B5097D88CF019 /* PullboxCore in Frameworks */ = {isa = PBXBuildFile; productRef = CCF46A5D3C1F430108741C7C /* PullboxCore */; };
 		78FC3B54EC18C635F54D059D /* PullboxApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = E020968937974FEA7E4F52C2 /* PullboxApp.swift */; };
+		ADF6A2E2A85ECF987631999B /* PullboxLiveActivity.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = B3CCFA03A9211880E6944F01 /* PullboxLiveActivity.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		BCE734C4D3F13840CECB3E89 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 5EA485E4EBFFF2F16969B64B /* Assets.xcassets */; };
 		D24D9EC3F5CFF7B5D9EC01B6 /* PullboxLiveActivityWidget.swift in Sources */ = {isa = PBXBuildFile; fileRef = D0774BA7B9A1785C86F47EC1 /* PullboxLiveActivityWidget.swift */; };
 		D6B1952A6C1EF49E0A11EED1 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A16F5ABC859D61D35E3DA92 /* ContentView.swift */; };
@@ -20,6 +21,13 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
+		1D970D1B0A49C3ABD905D22C /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = D4C1FD83321E5036C1C25CCA /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = E48A97CF8C2CD4EE2C967849;
+			remoteInfo = PullboxLiveActivity;
+		};
 		9376A127077D2162CC477FCB /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
 			containerPortal = D4C1FD83321E5036C1C25CCA /* Project object */;
@@ -37,6 +45,7 @@
 			dstSubfolderSpec = 13;
 			files = (
 				2BF3EECD700CEEB161E90311 /* PullboxShareExtension.appex in Embed Foundation Extensions */,
+				ADF6A2E2A85ECF987631999B /* PullboxLiveActivity.appex in Embed Foundation Extensions */,
 			);
 			name = "Embed Foundation Extensions";
 			runOnlyForDeploymentPostprocessing = 0;
@@ -168,6 +177,7 @@
 			);
 			dependencies = (
 				AE295D2937216447FD96A873 /* PBXTargetDependency */,
+				D9FE00E4A6EA6C2AD93D4C1A /* PBXTargetDependency */,
 			);
 			name = Pullbox;
 			packageProductDependencies = (
@@ -227,6 +237,7 @@
 					345BC2AA54997DF677F0DEF1 = {
 						DevelopmentTeam = 4973Y692JU;
 						ProvisioningStyle = Automatic;
+						SystemCapabilities = "[\"com.apple.Push\": [\"enabled\": 1]]";
 					};
 					ADB8C619FB3C824E5537BE6F = {
 						DevelopmentTeam = 4973Y692JU;
@@ -307,6 +318,11 @@
 			isa = PBXTargetDependency;
 			target = ADB8C619FB3C824E5537BE6F /* PullboxShareExtension */;
 			targetProxy = 9376A127077D2162CC477FCB /* PBXContainerItemProxy */;
+		};
+		D9FE00E4A6EA6C2AD93D4C1A /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = E48A97CF8C2CD4EE2C967849 /* PullboxLiveActivity */;
+			targetProxy = 1D970D1B0A49C3ABD905D22C /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 

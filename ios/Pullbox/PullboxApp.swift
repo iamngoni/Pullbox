@@ -1,35 +1,47 @@
 import SwiftUI
 import PullboxCore
 import UserNotifications
+import Photos
 
 class AppDelegate: NSObject, UIApplicationDelegate {
-    func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
-        // Request notification permission for Live Activity updates
+    private let backgroundCompletionHandler = BackgroundEventsCompletionHandler()
+    private var backgroundSession: URLSession?
+    private var activityPushObserver: AnyObject?
+    private lazy var backgroundDelegate = PullboxBackgroundSessionDelegate(
+        photoSaver: SystemPhotoLibrarySaver(),
+        onBackgroundEventsFinished: { [backgroundCompletionHandler] in
+            backgroundCompletionHandler.complete()
+        }
+    )
+
+    func application(
+        _ application: UIApplication,
+        didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
+    ) -> Bool {
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in }
-        // Ensure background session is configured
-        _ = PullboxBackgroundSessionCoordinator.makeSession()
+        PHPhotoLibrary.requestAuthorization(for: .addOnly) { _ in }
+
+        if #available(iOS 17.2, *) {
+            let observer = PullboxActivityPushObserver()
+            activityPushObserver = observer
+            let baseURL = BackgroundDownloadHandoff.resolveBaseURL()
+            observer.start(baseURL: baseURL)
+        }
         return true
     }
 
-    func application(_ application: UIApplication, handleEventsForBackgroundURLSession identifier: String, completionHandler: @escaping () -> Void) {
-        // System woke app to handle background download completions
-        if identifier == BackgroundDownloadHandoff.backgroundSessionIdentifier {
-            let session = PullboxBackgroundSessionCoordinator.makeSession()
-            // Store completion handler to call after delegate finishes
-            BackgroundCompletionHandler.completion = completionHandler
-            // Session delegate will handle completions
-            _ = session
-        } else {
+    func application(
+        _ application: UIApplication,
+        handleEventsForBackgroundURLSession identifier: String,
+        completionHandler: @escaping () -> Void
+    ) {
+        guard identifier == BackgroundDownloadHandoff.backgroundSessionIdentifier else {
             completionHandler()
+            return
         }
-    }
-}
 
-enum BackgroundCompletionHandler {
-    nonisolated(unsafe) static var completion: (() -> Void)?
-    static func complete() {
-        completion?()
-        completion = nil
+        backgroundCompletionHandler.install(completionHandler)
+        backgroundSession = PullboxBackgroundSessionCoordinator.makeSession(delegate: backgroundDelegate)
     }
 }
 

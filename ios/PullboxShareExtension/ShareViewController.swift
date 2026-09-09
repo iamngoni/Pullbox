@@ -10,11 +10,34 @@ private let pullboxAccent = Color(red: 0.345, green: 0.278, blue: 0.91)
 final class ShareViewModel: ObservableObject {
     enum State {
         case readingLink
-        case queued(URL)
-        case failure(String)
+        case resolving(URL)
+        case ready(MediaInfo, requestID: UUID)
+        case queueing(MediaInfo)
+        case failure(String, retryURL: URL?)
+
+        var isQueueing: Bool {
+            if case .queueing = self { return true }
+            return false
+        }
     }
 
     @Published var state: State = .readingLink
+}
+
+@MainActor
+private final class ShareBackgroundTransferRuntime {
+    static let shared = ShareBackgroundTransferRuntime()
+
+    let enqueuer: SystemBackgroundTransferEnqueuer
+    private let delegate: PullboxBackgroundSessionDelegate
+
+    private init() {
+        let delegate = PullboxBackgroundSessionDelegate(
+            photoSaver: SystemPhotoLibrarySaver()
+        )
+        self.delegate = delegate
+        self.enqueuer = SystemBackgroundTransferEnqueuer(delegate: delegate)
+    }
 }
 
 final class ShareViewController: UIViewController {
@@ -27,7 +50,10 @@ final class ShareViewController: UIViewController {
         let content = ShareExtensionView(
             model: model,
             onCancel: { [weak self] in self?.cancel() },
-            onDone: { [weak self] in self?.finish() }
+            onDownload: { [weak self] media, requestID in
+                self?.confirmDownload(media, requestID: requestID)
+            },
+            onRetry: { [weak self] url in self?.startResolving(url) }
         )
         let hostingController = UIHostingController(rootView: content)
         self.hostingController = hostingController
@@ -48,7 +74,7 @@ final class ShareViewController: UIViewController {
 
     private func loadSharedURL() {
         guard let items = extensionContext?.inputItems as? [NSExtensionItem] else {
-            model.state = .failure("Pullbox could not read the shared item.")
+            model.state = .failure("Pullbox could not read the shared item.", retryURL: nil)
             return
         }
 
@@ -67,7 +93,7 @@ final class ShareViewController: UIViewController {
             return
         }
 
-        model.state = .failure("Share a web link with Pullbox.")
+        model.state = .failure("Share a web link with Pullbox.", retryURL: nil)
     }
 
     private func load(_ provider: NSItemProvider, typeIdentifier: String) {
@@ -86,41 +112,66 @@ final class ShareViewController: UIViewController {
             Task { @MainActor [weak self, value] in
                 guard let self else { return }
                 if let value, let url = ShareURLExtractor.firstWebURL(in: value) {
-                    await self.enqueueAndDismiss(url)
+                    self.startResolving(url)
                 } else {
-                    self.model.state = .failure("Pullbox could not find a web link in this item.")
+                    self.model.state = .failure(
+                        "Pullbox could not find a web link in this item.",
+                        retryURL: nil
+                    )
                 }
             }
         }
     }
 
-    // MARK: - Queue + Immediate Dismiss (CEO requirement)
-
-    private func enqueueAndDismiss(_ url: URL) async {
+    @MainActor
+    private func startResolving(_ url: URL) {
         workTask?.cancel()
+        model.state = .resolving(url)
+        let flow = makeFlow()
+
         workTask = Task { @MainActor [weak self] in
             guard let self else { return }
             do {
-                // Durable enqueue + system-owned background transfer + Live Activity (awaited before dismiss)
-                let baseURL = BackgroundDownloadHandoff.resolveBaseURL()
-                _ = try await BackgroundDownloadHandoff.enqueueAndNotify(
-                    sourceURL: url,
-                    store: nil,
-                    activityManager: nil,
-                    baseURL: baseURL,
-                    backgroundEnqueuer: SystemBackgroundTransferEnqueuer()
-                )
-                // Success: show queued briefly then dismiss immediately
-                self.model.state = .queued(url)
-                // Ensure Live Activity is visible before teardown (already awaited above)
-                try? await Task.sleep(nanoseconds: 700_000_000)
-                self.finish()
+                let media = try await flow.resolve(sourceURL: url)
+                try Task.checkCancellation()
+                self.model.state = .ready(media, requestID: UUID())
+            } catch is CancellationError {
+                return
             } catch {
-                // Enqueue failure handled without falsely reporting success
-                self.model.state = .failure(error.localizedDescription)
+                self.model.state = .failure(error.localizedDescription, retryURL: url)
             }
         }
-        await workTask?.value
+    }
+
+    @MainActor
+    private func confirmDownload(_ media: MediaInfo, requestID: UUID) {
+        guard !model.state.isQueueing else { return }
+        workTask?.cancel()
+        model.state = .queueing(media)
+        let flow = makeFlow()
+
+        workTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                _ = try await flow.confirmDownload(for: media, requestID: requestID)
+                // Only the user's Download tap reaches this durable handoff. Once the
+                // system owns the transfer, dismiss immediately without waiting for it.
+                self.finish()
+            } catch {
+                self.model.state = .failure(error.localizedDescription, retryURL: media.sourceURL)
+            }
+        }
+    }
+
+    private func makeFlow() -> ShareSheetDownloadFlow {
+        let baseURL = BackgroundDownloadHandoff.resolveBaseURL()
+        return ShareSheetDownloadFlow(
+            analyzer: APIClient(baseURL: baseURL),
+            queue: SystemShareDownloadQueue(
+                baseURL: baseURL,
+                backgroundEnqueuer: ShareBackgroundTransferRuntime.shared.enqueuer
+            )
+        )
     }
 
     private func cancel() {
@@ -136,7 +187,8 @@ final class ShareViewController: UIViewController {
 struct ShareExtensionView: View {
     @ObservedObject var model: ShareViewModel
     let onCancel: () -> Void
-    let onDone: () -> Void
+    let onDownload: (MediaInfo, UUID) -> Void
+    let onRetry: (URL) -> Void
 
     var body: some View {
         NavigationStack {
@@ -160,11 +212,8 @@ struct ShareExtensionView: View {
             }
             .background(Color(uiColor: .systemBackground))
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    if case .queued = model.state {
-                        Button("Done", action: onDone)
-                            .fontWeight(.semibold)
-                    } else {
+                if !model.state.isQueueing {
+                    ToolbarItem(placement: .cancellationAction) {
                         Button(action: onCancel) {
                             Image(systemName: "xmark")
                         }
@@ -195,21 +244,26 @@ struct ShareExtensionView: View {
 
     private var title: String {
         switch model.state {
-        case .queued: return "Queued for Pullbox"
-        case .failure: return "Couldn’t queue link"
         case .readingLink: return "Save with Pullbox"
+        case .resolving: return "Resolving link"
+        case .ready: return "Ready to download"
+        case .queueing: return "Starting download"
+        case .failure: return "Couldn’t prepare link"
         }
     }
 
     private var message: String {
         switch model.state {
-        case .readingLink: return "Reading the shared link."
-        case .queued(let url):
-            if let host = url.host() {
-                return "Handed \(host) to Pullbox. Follow progress in the Live Activity."
-            }
-            return "Handed to Pullbox for download. Follow progress in the Live Activity."
-        case .failure(let message): return message
+        case .readingLink:
+            return "Reading the shared link."
+        case .resolving(let url):
+            return "Checking \(url.host() ?? "the shared link") with Pullbox."
+        case .ready:
+            return "Review the resolved media, then tap Download."
+        case .queueing:
+            return "Handing the download to iOS. This sheet will close automatically."
+        case .failure(let message, _):
+            return message
         }
     }
 
@@ -219,33 +273,96 @@ struct ShareExtensionView: View {
         case .readingLink:
             ProgressView("Reading link…")
                 .frame(maxWidth: .infinity, minHeight: 140)
-        case .queued:
+        case .resolving:
+            ProgressView("Resolving media…")
+                .frame(maxWidth: .infinity, minHeight: 140)
+        case .ready(let media, let requestID):
+            preview(media, requestID: requestID)
+        case .queueing:
             VStack(spacing: 14) {
-                Image(systemName: "checkmark.circle.fill")
-                    .font(.system(size: 64))
-                    .foregroundStyle(Color(red: 0.118, green: 0.725, blue: 0.561))
-                Text("Queued — Pullbox will download and save it. You can close this sheet.")
+                ProgressView()
+                    .controlSize(.large)
+                Text("Queueing background download…")
                     .font(.subheadline.weight(.medium))
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-                // Live Activity hint
-                Label("Check Live Activity / Dynamic Island for progress", systemImage: "chart.bar.doc.horizontal")
-                    .font(.caption)
                     .foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, minHeight: 160)
-            .transition(.scale.combined(with: .opacity))
-        case .failure:
-            VStack(spacing: 12) {
+        case .failure(_, let retryURL):
+            VStack(spacing: 14) {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .font(.system(size: 54))
                     .foregroundStyle(Color(uiColor: .systemOrange))
-                Text("Try sharing again. If the link is private, Pullbox can only save public media.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
+                if let retryURL {
+                    Button("Try Again") { onRetry(retryURL) }
+                        .buttonStyle(.borderedProminent)
+                }
             }
             .frame(maxWidth: .infinity, minHeight: 140)
         }
+    }
+
+    private func preview(_ media: MediaInfo, requestID: UUID) -> some View {
+        VStack(alignment: .leading, spacing: 16) {
+            if let thumbnail = media.thumbnail {
+                AsyncImage(url: thumbnail) { image in
+                    image
+                        .resizable()
+                        .scaledToFill()
+                } placeholder: {
+                    ZStack {
+                        Color(uiColor: .secondarySystemBackground)
+                        ProgressView()
+                    }
+                }
+                .frame(maxWidth: .infinity)
+                .frame(height: 180)
+                .clipShape(RoundedRectangle(cornerRadius: 16))
+            }
+
+            VStack(alignment: .leading, spacing: 5) {
+                Text(media.title)
+                    .font(.headline)
+                    .lineLimit(3)
+                HStack(spacing: 8) {
+                    if let host = media.sourceURL.host() {
+                        Text(host)
+                    }
+                    if let duration = media.duration {
+                        Text("•")
+                        Text(duration.formattedDuration)
+                    }
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+
+            Button {
+                onDownload(media, requestID)
+            } label: {
+                Label("Download", systemImage: "arrow.down.circle.fill")
+                    .font(.headline)
+                    .frame(maxWidth: .infinity)
+                    .frame(minHeight: 50)
+            }
+            .buttonStyle(.borderedProminent)
+            .buttonBorderShape(.roundedRectangle(radius: 14))
+            .accessibilityLabel("Download resolved media")
+
+            Label(
+                "After you tap Download, Pullbox queues the transfer and posts status notifications.",
+                systemImage: "bell.badge"
+            )
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
+        .padding(16)
+        .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 18))
+    }
+}
+
+private extension Double {
+    var formattedDuration: String {
+        let total = Int(rounded())
+        return String(format: "%d:%02d", total / 60, total % 60)
     }
 }

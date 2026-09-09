@@ -32,22 +32,51 @@ public struct APIRequestBuilder: Sendable {
     }
 
     public func analyze(sourceURL: URL) throws -> URLRequest {
-        try request(path: "api/analyze", sourceURL: sourceURL)
+        try request(path: "api/analyze", body: ["url": sourceURL.absoluteString])
     }
 
-    public func download(sourceURL: URL) throws -> URLRequest {
-        try request(path: "api/download", sourceURL: sourceURL)
+    public func download(
+        sourceURL: URL,
+        requestID: UUID? = nil,
+        title: String? = nil,
+        clientID: String? = nil
+    ) throws -> URLRequest {
+        var body: [String: Any] = ["url": sourceURL.absoluteString]
+        if let requestID { body["requestId"] = requestID.uuidString }
+        if let title { body["title"] = title }
+        if let clientID { body["clientId"] = clientID }
+        return try request(path: "api/download", body: body)
     }
 
-    private func request(path: String, sourceURL: URL) throws -> URLRequest {
+    public func registerPushToStartToken(clientID: String, token: String) throws -> URLRequest {
+        try request(
+            path: "api/live-activity/push-to-start-token",
+            body: ["clientId": clientID, "token": token]
+        )
+    }
+
+    public func registerActivityUpdateToken(
+        clientID: String,
+        requestID: UUID,
+        token: String
+    ) throws -> URLRequest {
+        try request(
+            path: "api/live-activity/update-token",
+            body: [
+                "clientId": clientID,
+                "requestId": requestID.uuidString,
+                "token": token,
+            ]
+        )
+    }
+
+    private func request(path: String, body: [String: Any]) throws -> URLRequest {
         let endpoint = baseURL.appending(path: path)
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.timeoutInterval = 900
-        request.httpBody = try JSONSerialization.data(withJSONObject: [
-            "url": sourceURL.absoluteString
-        ])
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
         return request
     }
 }

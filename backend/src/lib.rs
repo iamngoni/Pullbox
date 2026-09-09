@@ -1,3 +1,10 @@
+//! Serves Pullbox media analysis/download routes and Live Activity token registration.
+//!
+//! APNs delivery is best-effort and never changes the existing media response contract.
+
+pub mod apns;
+pub mod progress;
+
 use actix_web::{web, HttpResponse, Responder};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -94,6 +101,48 @@ pub struct MediaInfo {
 pub struct DownloadRequest {
     pub url: String,
     pub format_id: Option<String>,
+    pub request_id: Option<String>,
+    pub title: Option<String>,
+    pub client_id: Option<String>,
+}
+
+impl DownloadRequest {
+    /// Returns a notification context only when every backwards-compatible field is present.
+    pub fn activity_context(&self, source_url: &Url) -> Option<apns::ActivityNotificationContext> {
+        let request_id = self
+            .request_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())?;
+        let title = self
+            .title
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())?;
+        let client_id = self
+            .client_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())?;
+        Some(apns::ActivityNotificationContext::new(
+            client_id,
+            request_id,
+            title,
+            source_url.as_str(),
+        ))
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PushToStartTokenRequest {
+    client_id: String,
+    token: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateTokenRequest {
+    client_id: String,
+    request_id: String,
+    token: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -105,7 +154,79 @@ pub fn configure(config: &mut web::ServiceConfig) {
     config
         .route("/health", web::get().to(health))
         .route("/api/analyze", web::post().to(analyze))
-        .route("/api/download", web::post().to(download));
+        .route("/api/download", web::post().to(download))
+        .route(
+            "/api/live-activity/push-to-start-token",
+            web::post().to(register_push_to_start_token),
+        )
+        .route(
+            "/api/live-activity/update-token",
+            web::post().to(register_update_token),
+        );
+}
+
+async fn register_push_to_start_token(
+    registry: Option<web::Data<apns::TokenRegistry>>,
+    body: web::Json<PushToStartTokenRequest>,
+) -> HttpResponse {
+    let Some(registry) = registry else {
+        return HttpResponse::ServiceUnavailable().json(ErrorBody {
+            error: "Live Activity token registration is unavailable".to_string(),
+        });
+    };
+    if body.client_id.trim().is_empty() {
+        return HttpResponse::BadRequest().json(ErrorBody {
+            error: "clientId must not be empty".to_string(),
+        });
+    }
+    let token = match apns::DeviceToken::parse(&body.token) {
+        Ok(token) => token,
+        Err(error) => {
+            return HttpResponse::BadRequest().json(ErrorBody {
+                error: error.to_string(),
+            });
+        }
+    };
+
+    if let Err(error) = registry.register_push_to_start(&body.client_id, token) {
+        log::error!("Could not persist Live Activity token: {error}");
+        return HttpResponse::InternalServerError().json(ErrorBody {
+            error: "Could not save Live Activity registration".to_string(),
+        });
+    }
+    HttpResponse::NoContent().finish()
+}
+
+async fn register_update_token(
+    registry: Option<web::Data<apns::TokenRegistry>>,
+    body: web::Json<UpdateTokenRequest>,
+) -> HttpResponse {
+    let Some(registry) = registry else {
+        return HttpResponse::ServiceUnavailable().json(ErrorBody {
+            error: "Live Activity token registration is unavailable".to_string(),
+        });
+    };
+    if body.client_id.trim().is_empty() || body.request_id.trim().is_empty() {
+        return HttpResponse::BadRequest().json(ErrorBody {
+            error: "clientId and requestId must not be empty".to_string(),
+        });
+    }
+    let token = match apns::DeviceToken::parse(&body.token) {
+        Ok(token) => token,
+        Err(error) => {
+            return HttpResponse::BadRequest().json(ErrorBody {
+                error: error.to_string(),
+            });
+        }
+    };
+
+    if let Err(error) = registry.register_update(&body.client_id, &body.request_id, token) {
+        log::error!("Could not persist Live Activity token: {error}");
+        return HttpResponse::InternalServerError().json(ErrorBody {
+            error: "Could not save Live Activity registration".to_string(),
+        });
+    }
+    HttpResponse::NoContent().finish()
 }
 
 async fn health() -> impl Responder {
@@ -189,7 +310,21 @@ async fn analyze(body: web::Json<UrlRequest>) -> impl Responder {
     })
 }
 
-async fn download(body: web::Json<DownloadRequest>) -> impl Responder {
+async fn failed_download_response(
+    notifications: &apns::DownloadNotificationSession,
+    status: actix_web::http::StatusCode,
+    error: String,
+) -> HttpResponse {
+    notifications
+        .failed("Pullbox couldn’t finish this download.")
+        .await;
+    HttpResponse::build(status).json(ErrorBody { error })
+}
+
+async fn download(
+    body: web::Json<DownloadRequest>,
+    notifier: Option<web::Data<apns::ActivityNotifierHandle>>,
+) -> impl Responder {
     let extraction_url = normalize_url(&body.url);
     let parsed = match validate_http_url(&extraction_url) {
         Ok(url) => url,
@@ -200,12 +335,21 @@ async fn download(body: web::Json<DownloadRequest>) -> impl Responder {
         }
     };
 
+    let notifications = apns::DownloadNotificationSession::begin(
+        body.activity_context(&parsed),
+        notifier.map(|handle| handle.get_ref().clone()),
+    )
+    .await;
+
     let directory = match tempfile::tempdir() {
         Ok(value) => value,
         Err(error) => {
-            return HttpResponse::InternalServerError().json(ErrorBody {
-                error: format!("Could not create temporary storage: {error}"),
-            });
+            return failed_download_response(
+                &notifications,
+                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Could not create temporary storage: {error}"),
+            )
+            .await;
         }
     };
     let output_template = directory.path().join("source-%(id)s.%(ext)s");
@@ -213,9 +357,9 @@ async fn download(body: web::Json<DownloadRequest>) -> impl Responder {
     let format = choose_format(body.format_id.as_deref()).to_string();
 
     let mut cmd = Command::new("yt-dlp");
+    cmd.arg("--no-playlist");
+    progress::configure_ytdlp_progress(&mut cmd);
     cmd.args([
-        "--no-playlist",
-        "--no-progress",
         "--write-thumbnail",
         "--convert-thumbnails",
         "jpg",
@@ -232,20 +376,22 @@ async fn download(body: web::Json<DownloadRequest>) -> impl Responder {
     if let Some(jar) = platform_cookies(parsed.as_str()) {
         cmd.arg("--cookies").arg(&jar);
     }
-    let output = cmd.arg(parsed.as_str()).output().await;
+    cmd.arg(parsed.as_str());
+    let output =
+        progress::run_command_with_progress(&mut cmd, |value| notifications.progress(value)).await;
 
     let output = match output {
         Ok(value) if value.status.success() => value,
         Ok(value) => {
-            let detail = String::from_utf8_lossy(&value.stderr).to_string();
+            let detail = value.stderr.clone();
             let lower = detail.to_ascii_lowercase();
             if lower.contains("there is no video in this post")
                 || lower.contains("no video formats found")
             {
                 let mut retry_cmd = Command::new("yt-dlp");
+                retry_cmd.arg("--no-playlist");
+                progress::configure_ytdlp_progress(&mut retry_cmd);
                 retry_cmd.args([
-                    "--no-playlist",
-                    "--no-progress",
                     "--write-thumbnail",
                     "--convert-thumbnails",
                     "jpg",
@@ -260,11 +406,16 @@ async fn download(body: web::Json<DownloadRequest>) -> impl Responder {
                 if let Some(jar) = platform_cookies(parsed.as_str()) {
                     retry_cmd.arg("--cookies").arg(&jar);
                 }
-                let retry = retry_cmd.arg(parsed.as_str()).output().await;
+                retry_cmd.arg(parsed.as_str());
+                let retry = progress::run_command_with_progress(&mut retry_cmd, |value| {
+                    notifications.progress(value)
+                })
+                .await;
                 match retry {
                     Ok(r) if r.status.success() => r,
                     Ok(r) => {
-                        let d = String::from_utf8_lossy(&r.stderr)
+                        let d = r
+                            .stderr
                             .lines()
                             .last()
                             .unwrap_or("Download failed")
@@ -273,12 +424,20 @@ async fn download(body: web::Json<DownloadRequest>) -> impl Responder {
                             &d,
                             "Pullbox couldn’t download media from this link.",
                         );
-                        return HttpResponse::UnprocessableEntity().json(ErrorBody { error: msg });
+                        return failed_download_response(
+                            &notifications,
+                            actix_web::http::StatusCode::UNPROCESSABLE_ENTITY,
+                            msg,
+                        )
+                        .await;
                     }
                     Err(e) => {
-                        return HttpResponse::InternalServerError().json(ErrorBody {
-                            error: format!("Could not start yt-dlp: {e}"),
-                        })
+                        return failed_download_response(
+                            &notifications,
+                            actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("Could not start yt-dlp: {e}"),
+                        )
+                        .await;
                     }
                 }
             } else {
@@ -291,26 +450,38 @@ async fn download(body: web::Json<DownloadRequest>) -> impl Responder {
                     &d,
                     "Pullbox couldn’t download a playable video from this link.",
                 );
-                return HttpResponse::UnprocessableEntity().json(ErrorBody { error: message });
+                return failed_download_response(
+                    &notifications,
+                    actix_web::http::StatusCode::UNPROCESSABLE_ENTITY,
+                    message,
+                )
+                .await;
             }
         }
         Err(error) => {
-            return HttpResponse::InternalServerError().json(ErrorBody {
-                error: format!("Could not start yt-dlp: {error}"),
-            });
+            return failed_download_response(
+                &notifications,
+                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Could not start yt-dlp: {error}"),
+            )
+            .await;
         }
     };
 
-    let path = String::from_utf8_lossy(&output.stdout)
+    let path = output
+        .stdout
         .lines()
         .rfind(|line| !line.trim().is_empty())
         .map(str::trim)
         .unwrap_or_default()
         .to_string();
     if path.is_empty() {
-        return HttpResponse::InternalServerError().json(ErrorBody {
-            error: "yt-dlp completed without returning a file".to_string(),
-        });
+        return failed_download_response(
+            &notifications,
+            actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "yt-dlp completed without returning a file".to_string(),
+        )
+        .await;
     }
 
     let main_path = Path::new(&path);
@@ -408,9 +579,12 @@ async fn download(body: web::Json<DownloadRequest>) -> impl Responder {
         let bytes = match tokio::fs::read(&final_image).await {
             Ok(v) => v,
             Err(e) => {
-                return HttpResponse::InternalServerError().json(ErrorBody {
-                    error: format!("Could not read image: {e}"),
-                })
+                return failed_download_response(
+                    &notifications,
+                    actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Could not read image: {e}"),
+                )
+                .await;
             }
         };
         // Detect content type from extension
@@ -425,6 +599,7 @@ async fn download(body: web::Json<DownloadRequest>) -> impl Responder {
             "image/jpeg"
         };
         let filename = "pullbox.jpg".to_string();
+        notifications.ready().await;
         return HttpResponse::Ok()
             .content_type(ct)
             .insert_header((
@@ -477,11 +652,15 @@ async fn download(body: web::Json<DownloadRequest>) -> impl Responder {
                     let bytes = match tokio::fs::read(&compatible_path).await {
                         Ok(v) => v,
                         Err(e) => {
-                            return HttpResponse::InternalServerError().json(ErrorBody {
-                                error: format!("Could not read video: {e}"),
-                            })
+                            return failed_download_response(
+                                &notifications,
+                                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("Could not read video: {e}"),
+                            )
+                            .await;
                         }
                     };
+                    notifications.ready().await;
                     return HttpResponse::Ok()
                         .content_type("video/mp4")
                         .insert_header((
@@ -496,14 +675,20 @@ async fn download(body: web::Json<DownloadRequest>) -> impl Responder {
                         .last()
                         .unwrap_or("ffmpeg error")
                         .to_string();
-                    return HttpResponse::InternalServerError().json(ErrorBody {
-                        error: format!("Failed to create video from image + audio: {}", err),
-                    });
+                    return failed_download_response(
+                        &notifications,
+                        actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to create video from image + audio: {err}"),
+                    )
+                    .await;
                 }
                 Err(e) => {
-                    return HttpResponse::InternalServerError().json(ErrorBody {
-                        error: format!("Could not start ffmpeg for image+audio: {e}"),
-                    });
+                    return failed_download_response(
+                        &notifications,
+                        actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Could not start ffmpeg for image+audio: {e}"),
+                    )
+                    .await;
                 }
             }
         }
@@ -512,18 +697,27 @@ async fn download(body: web::Json<DownloadRequest>) -> impl Responder {
     // Standard video path
     let compatible_path = dir.join("pullbox-photos.mp4");
     if let Err(message) = transcode_for_photos(main_path, &compatible_path).await {
-        return HttpResponse::InternalServerError().json(ErrorBody { error: message });
+        return failed_download_response(
+            &notifications,
+            actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+            message,
+        )
+        .await;
     }
 
     let bytes = match tokio::fs::read(&compatible_path).await {
         Ok(value) => value,
         Err(error) => {
-            return HttpResponse::InternalServerError().json(ErrorBody {
-                error: format!("Could not read the Photos-compatible video: {error}"),
-            });
+            return failed_download_response(
+                &notifications,
+                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Could not read the Photos-compatible video: {error}"),
+            )
+            .await;
         }
     };
 
+    notifications.ready().await;
     HttpResponse::Ok()
         .content_type("video/mp4")
         .insert_header((

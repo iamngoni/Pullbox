@@ -7,7 +7,10 @@ services:
     container_name: pullbox
     environment:
       PULLBOX_BIND: 0.0.0.0:8787
+      PULLBOX_APNS_TOKEN_STORE_PATH: /data/live-activity-tokens.json
       RUST_LOG: info
+    volumes:
+      - pullbox-data:/data
     ports:
       - "127.0.0.1:8787:8787"
     labels:
@@ -25,3 +28,6 @@ networks:
   media-server:
     name: media-server_default
     external: true
+
+volumes:
+  pullbox-data:
