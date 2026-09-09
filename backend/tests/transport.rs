@@ -219,3 +219,39 @@ async fn first_update_waits_for_the_token_registered_after_push_start() {
     assert_eq!(outcome, NotificationOutcome::Accepted);
     assert_eq!(transport.requests.lock().unwrap().len(), 1);
 }
+
+#[actix_rt::test]
+async fn ready_without_a_token_prevents_late_registration_from_leaking() {
+    let registry = TokenRegistry::default();
+    let transport = Arc::new(FakeTransport {
+        requests: Mutex::new(Vec::new()),
+        status: 200,
+        reason: None,
+    });
+    let client = Arc::new(ApnsClient::new(test_config(), transport.clone()));
+    let notifier = ApnsActivityNotifier::new(registry.clone(), client);
+    let context = ActivityNotificationContext::new(
+        "client-late-terminal",
+        "request-late-terminal",
+        "Late terminal clip",
+        "https://example.com/video",
+    );
+
+    let outcome = notifier
+        .ready(&context, 1_725_000_020)
+        .await
+        .expect("ready outcome");
+    registry
+        .register_update(
+            "client-late-terminal",
+            "request-late-terminal",
+            DeviceToken::parse("55667788").unwrap(),
+        )
+        .expect("late registration is an accepted no-op");
+
+    assert_eq!(outcome, NotificationOutcome::MissingToken);
+    assert!(registry
+        .update_token("client-late-terminal", "request-late-terminal")
+        .is_none());
+    assert!(transport.requests.lock().unwrap().is_empty());
+}

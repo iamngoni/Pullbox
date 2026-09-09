@@ -27,6 +27,8 @@ Endpoints:
 - `POST /api/live-activity/push-to-start-token` with `{ "clientId": "<UUID>", "token": "<hex>" }`
 - `POST /api/live-activity/update-token` with `{ "clientId": "<UUID>", "requestId": "<UUID>", "token": "<hex>" }`
 
+Analyze/download JSON bodies are capped at 1 MiB so extractor-provided URLs and titles can round-trip. Live Activity token-registration bodies use a separate 16 KiB cap, and individual hexadecimal tokens are limited to 256 characters. Oversized display titles and signed source URLs are bounded only when constructing the 4 KiB APNs payload; the downloader still receives the full media URL.
+
 Override the bind address with `PULLBOX_BIND`, for example:
 
 ```bash
@@ -67,7 +69,7 @@ The container joins the existing `media-server_default` network and advertises `
 
 ### Live Activity APNs configuration
 
-The iPhone app registers an install-level push-to-start token and a per-download update token with the backend. The backend stores them in `PULLBOX_APNS_TOKEN_STORE_PATH`; Docker Compose mounts `/data/live-activity-tokens.json` from the persistent `pullbox-data` volume. The file is written atomically with owner-only (`0600`) permissions.
+The iPhone app registers an install-level push-to-start token and a per-download update token with the backend. The backend stores them in `PULLBOX_APNS_TOKEN_STORE_PATH`; Docker Compose mounts `/data/live-activity-tokens.json` from the persistent `pullbox-data` volume. The file is written atomically with owner-only (`0600`) permissions. Backend-terminal requests retain a 24-hour tombstone so a late iOS registration cannot recreate an orphaned per-download token; expired tombstones are garbage-collected opportunistically.
 
 APNs is disabled when none of the following variables are present. Supplying only some of them is a startup error:
 

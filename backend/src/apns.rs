@@ -17,8 +17,12 @@ use std::{
 };
 use thiserror::Error;
 use tokio::sync::Notify;
+use url::Url;
 
 const MAX_DEVICE_TOKEN_HEX_LENGTH: usize = 256;
+const MAX_ACTIVITY_TITLE_CHARACTERS: usize = 160;
+const MAX_ACTIVITY_SOURCE_URL_BYTES: usize = 1_024;
+pub const TERMINAL_TOMBSTONE_TTL_SECONDS: i64 = 24 * 60 * 60;
 
 /// A validated APNs device token whose formatting never exposes its bytes.
 #[derive(Clone, Eq, Hash, PartialEq)]
@@ -400,10 +404,62 @@ pub enum ApnsConfigError {
     EmptyTopic,
 }
 
-#[derive(Clone, Default, Deserialize, Serialize)]
+#[derive(Clone, Default, Serialize)]
 struct TokenMaps {
     push_to_start: HashMap<String, DeviceToken>,
     updates: HashMap<String, HashMap<String, DeviceToken>>,
+    terminal_requests: HashMap<String, HashMap<String, i64>>,
+}
+
+#[derive(Default, Deserialize)]
+struct StoredTokenMaps {
+    #[serde(default)]
+    push_to_start: HashMap<String, String>,
+    #[serde(default)]
+    updates: HashMap<String, HashMap<String, String>>,
+    #[serde(default)]
+    terminal_requests: HashMap<String, HashMap<String, i64>>,
+}
+
+impl StoredTokenMaps {
+    fn validated(self) -> TokenMaps {
+        let push_to_start = self
+            .push_to_start
+            .into_iter()
+            .filter_map(|(client_id, raw)| {
+                DeviceToken::parse(&raw)
+                    .ok()
+                    .map(|token| (client_id, token))
+            })
+            .collect();
+        let updates = self
+            .updates
+            .into_iter()
+            .filter_map(|(client_id, requests)| {
+                let requests = requests
+                    .into_iter()
+                    .filter_map(|(request_id, raw)| {
+                        DeviceToken::parse(&raw)
+                            .ok()
+                            .map(|token| (request_id, token))
+                    })
+                    .collect::<HashMap<_, _>>();
+                (!requests.is_empty()).then_some((client_id, requests))
+            })
+            .collect();
+        TokenMaps {
+            push_to_start,
+            updates,
+            terminal_requests: self.terminal_requests,
+        }
+    }
+}
+
+fn prune_expired_terminal_requests(maps: &mut TokenMaps, now: i64) {
+    maps.terminal_requests.retain(|_, requests| {
+        requests.retain(|_, expires_at| *expires_at > now);
+        !requests.is_empty()
+    });
 }
 
 /// Concurrency-safe APNs token storage with optional atomic file persistence.
@@ -428,21 +484,23 @@ impl TokenRegistry {
     /// Loads a registry from an owner-only file, or starts empty if it doesn't exist.
     pub fn persistent(path: impl AsRef<Path>) -> Result<Self, TokenRegistryError> {
         let path = path.as_ref().to_path_buf();
-        let maps = match fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes)?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => TokenMaps::default(),
+        let (maps, existed) = match fs::read(&path) {
+            Ok(bytes) => {
+                let stored: StoredTokenMaps = serde_json::from_slice(&bytes)?;
+                (stored.validated(), true)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => (TokenMaps::default(), false),
             Err(error) => return Err(error.into()),
         };
-        #[cfg(unix)]
-        if path.exists() {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-        }
-        Ok(Self {
-            inner: Arc::new(RwLock::new(maps)),
+        let registry = Self {
+            inner: Arc::new(RwLock::new(maps.clone())),
             storage_path: Some(Arc::new(path)),
             update_notify: Arc::new(Notify::new()),
-        })
+        };
+        if existed {
+            registry.persist(&maps)?;
+        }
+        Ok(registry)
     }
 
     /// Replaces the push-to-start token for one client installation.
@@ -470,6 +528,18 @@ impl TokenRegistry {
     ) -> Result<(), TokenRegistryError> {
         let mut maps = self.write();
         let original = maps.clone();
+        prune_expired_terminal_requests(&mut maps, unix_timestamp());
+        if maps
+            .terminal_requests
+            .get(client_id)
+            .is_some_and(|requests| requests.contains_key(request_id))
+        {
+            if let Err(error) = self.persist(&maps) {
+                *maps = original;
+                return Err(error);
+            }
+            return Ok(());
+        }
         maps.updates
             .entry(client_id.to_owned())
             .or_default()
@@ -480,6 +550,35 @@ impl TokenRegistry {
         }
         drop(maps);
         self.update_notify.notify_waiters();
+        Ok(())
+    }
+
+    /// Marks a request terminal, removes its token, and prevents late re-registration.
+    pub fn mark_terminal(
+        &self,
+        client_id: &str,
+        request_id: &str,
+    ) -> Result<(), TokenRegistryError> {
+        let mut maps = self.write();
+        let original = maps.clone();
+        prune_expired_terminal_requests(&mut maps, unix_timestamp());
+        if let Some(requests) = maps.updates.get_mut(client_id) {
+            requests.remove(request_id);
+            if requests.is_empty() {
+                maps.updates.remove(client_id);
+            }
+        }
+        maps.terminal_requests
+            .entry(client_id.to_owned())
+            .or_default()
+            .insert(
+                request_id.to_owned(),
+                unix_timestamp().saturating_add(TERMINAL_TOMBSTONE_TTL_SECONDS),
+            );
+        if let Err(error) = self.persist(&maps) {
+            *maps = original;
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -704,12 +803,12 @@ impl ApnsActivityNotifier {
         Ok(NotificationOutcome::Accepted)
     }
 
-    fn release_update_token(&self, context: &ActivityNotificationContext) {
+    fn mark_terminal(&self, context: &ActivityNotificationContext) {
         if let Err(error) = self
             .registry
-            .remove_update(&context.client_id, &context.activity.request_id)
+            .mark_terminal(&context.client_id, &context.activity.request_id)
         {
-            log::error!("Could not remove completed Live Activity token: {error}");
+            log::error!("Could not persist completed Live Activity state: {error}");
         }
     }
 }
@@ -763,7 +862,7 @@ impl ActivityNotifier for ApnsActivityNotifier {
                 timestamp,
             )
             .await;
-        self.release_update_token(context);
+        self.mark_terminal(context);
         result
     }
 
@@ -781,7 +880,7 @@ impl ActivityNotifier for ApnsActivityNotifier {
                 timestamp,
             )
             .await;
-        self.release_update_token(context);
+        self.mark_terminal(context);
         result
     }
 }
@@ -905,18 +1004,43 @@ pub struct ActivityDescriptor {
 }
 
 impl ActivityDescriptor {
-    /// Creates a descriptor from server-validated request metadata.
+    /// Creates a descriptor with APNs-safe display metadata while retaining request identity.
     pub fn new(
         request_id: impl Into<String>,
         title: impl Into<String>,
         source_url: impl Into<String>,
     ) -> Self {
+        let title = title.into();
+        let source_url = source_url.into();
         Self {
             request_id: request_id.into(),
-            title: title.into(),
-            source_url: source_url.into(),
+            title: bounded_activity_title(&title),
+            source_url: bounded_activity_source_url(&source_url),
         }
     }
+}
+
+fn bounded_activity_title(title: &str) -> String {
+    if title.chars().count() <= MAX_ACTIVITY_TITLE_CHARACTERS {
+        return title.to_owned();
+    }
+    title
+        .chars()
+        .take(MAX_ACTIVITY_TITLE_CHARACTERS - 1)
+        .chain(std::iter::once('…'))
+        .collect()
+}
+
+fn bounded_activity_source_url(source_url: &str) -> String {
+    if source_url.len() <= MAX_ACTIVITY_SOURCE_URL_BYTES {
+        return source_url.to_owned();
+    }
+    Url::parse(source_url)
+        .ok()
+        .filter(|url| matches!(url.scheme(), "http" | "https"))
+        .map(|url| format!("{}/", url.origin().ascii_serialization()))
+        .filter(|origin| origin.len() <= MAX_ACTIVITY_SOURCE_URL_BYTES)
+        .unwrap_or_else(|| "https://pullbox.invalid/".to_string())
 }
 
 /// Builds an iOS 18+ push-to-start payload for Pullbox's ActivityKit schema.

@@ -109,7 +109,7 @@ struct ContentView: View {
             ForEach(queuedItems) { item in
                 queuedRow(item)
             }
-            Text("Queued via Share Sheet — Live Activity shows progress in Dynamic Island.")
+            Text("Queued via Share Sheet — transfers continue after the sheet closes.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }

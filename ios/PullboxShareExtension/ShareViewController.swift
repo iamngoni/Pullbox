@@ -349,8 +349,8 @@ struct ShareExtensionView: View {
             .accessibilityLabel("Download resolved media")
 
             Label(
-                "After you tap Download, Pullbox queues the transfer and posts status notifications.",
-                systemImage: "bell.badge"
+                "After you tap Download, Pullbox queues the transfer and closes this sheet.",
+                systemImage: "arrow.down.circle"
             )
             .font(.caption)
             .foregroundStyle(.secondary)

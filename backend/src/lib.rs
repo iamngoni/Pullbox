@@ -151,18 +151,23 @@ pub struct ErrorBody {
 }
 
 pub fn configure(config: &mut web::ServiceConfig) {
+    const MEDIA_REQUEST_LIMIT: usize = 1024 * 1024;
+    const TOKEN_REGISTRATION_LIMIT: usize = 16 * 1024;
+
     config
-        .app_data(web::JsonConfig::default().limit(16 * 1024))
+        .app_data(web::JsonConfig::default().limit(MEDIA_REQUEST_LIMIT))
         .route("/health", web::get().to(health))
         .route("/api/analyze", web::post().to(analyze))
         .route("/api/download", web::post().to(download))
-        .route(
-            "/api/live-activity/push-to-start-token",
-            web::post().to(register_push_to_start_token),
+        .service(
+            web::resource("/api/live-activity/push-to-start-token")
+                .app_data(web::JsonConfig::default().limit(TOKEN_REGISTRATION_LIMIT))
+                .route(web::post().to(register_push_to_start_token)),
         )
-        .route(
-            "/api/live-activity/update-token",
-            web::post().to(register_update_token),
+        .service(
+            web::resource("/api/live-activity/update-token")
+                .app_data(web::JsonConfig::default().limit(TOKEN_REGISTRATION_LIMIT))
+                .route(web::post().to(register_update_token)),
         );
 }
 

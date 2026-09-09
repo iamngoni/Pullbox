@@ -49,6 +49,29 @@ fn start_payload_matches_activitykit_contract() {
 }
 
 #[test]
+fn start_payload_bounds_display_metadata_without_changing_request_identity() {
+    let activity = ActivityDescriptor::new(
+        "request-123",
+        "🦀".repeat(1_000),
+        format!("https://example.com/video?signature={}", "a".repeat(10_000)),
+    );
+
+    let payload = build_start_payload(&activity, 1_725_000_000);
+    let encoded = serde_json::to_vec(&payload).expect("encode payload");
+    let title = payload["aps"]["content-state"]["title"]
+        .as_str()
+        .expect("bounded title");
+
+    assert!(title.chars().count() <= 160);
+    assert_eq!(payload["aps"]["attributes"]["id"], "request-123");
+    assert_eq!(
+        payload["aps"]["attributes"]["sourceURL"],
+        "https://example.com/"
+    );
+    assert!(encoded.len() <= 4 * 1024);
+}
+
+#[test]
 fn update_payload_reports_fractional_server_download_progress() {
     let activity =
         ActivityDescriptor::new("request-123", "Example clip", "https://example.com/video");

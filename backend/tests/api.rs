@@ -32,6 +32,24 @@ async fn download_rejects_non_http_urls_before_running_downloader() {
 }
 
 #[actix_rt::test]
+async fn download_accepts_metadata_bodies_larger_than_the_token_registration_limit() {
+    let app = test::init_service(App::new().configure(configure)).await;
+    let request = test::TestRequest::post()
+        .uri("/api/download")
+        .set_json(serde_json::json!({
+            "url": "file:///etc/passwd",
+            "requestId": "request-456",
+            "clientId": "client-123",
+            "title": "x".repeat(20 * 1024)
+        }))
+        .to_request();
+
+    let response = test::call_service(&app, request).await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[actix_rt::test]
 async fn push_to_start_registration_stores_token_without_echoing_it() {
     let registry = TokenRegistry::default();
     let app = test::init_service(
