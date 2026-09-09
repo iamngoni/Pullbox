@@ -1,4 +1,4 @@
-use actix_web::{App, http::StatusCode, test};
+use actix_web::{http::StatusCode, test, App};
 use pullbox_backend::configure;
 
 #[actix_rt::test]

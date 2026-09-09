@@ -73,8 +73,11 @@ public actor APIClient {
         let (temporaryURL, response) = try await session.download(for: request)
         let errorData = (try? Data(contentsOf: temporaryURL)) ?? Data()
         try Self.validate(response: response, data: errorData)
+        let contentType = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Content-Type")?.lowercased() ?? ""
+        let isImage = contentType.hasPrefix("image/")
+        let ext = isImage ? (contentType.contains("png") ? "png" : "jpg") : "mp4"
         let destination = FileManager.default.temporaryDirectory
-            .appending(path: "Pullbox-\(UUID().uuidString).mp4")
+            .appending(path: "Pullbox-\(UUID().uuidString).\(ext)")
         try? FileManager.default.removeItem(at: destination)
         try FileManager.default.moveItem(at: temporaryURL, to: destination)
         return destination

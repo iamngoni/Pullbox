@@ -1,5 +1,5 @@
 use actix_cors::Cors;
-use actix_web::{App, HttpServer, middleware::Logger};
+use actix_web::{middleware::Logger, App, HttpServer};
 use pullbox_backend::configure;
 
 #[actix_web::main]

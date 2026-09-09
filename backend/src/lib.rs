@@ -1,4 +1,4 @@
-use actix_web::{HttpResponse, Responder, web};
+use actix_web::{web, HttpResponse, Responder};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
@@ -125,11 +125,11 @@ async fn analyze(body: web::Json<UrlRequest>) -> impl Responder {
 
     let mut cmd = Command::new("yt-dlp");
     cmd.args([
-            "--dump-single-json",
-            "--skip-download",
-            "--no-playlist",
-            "--ignore-no-formats-error",
-        ]);
+        "--dump-single-json",
+        "--skip-download",
+        "--no-playlist",
+        "--ignore-no-formats-error",
+    ]);
     if let Some(jar) = platform_cookies(parsed.as_str()) {
         cmd.arg("--cookies").arg(jar);
     }
@@ -214,21 +214,21 @@ async fn download(body: web::Json<DownloadRequest>) -> impl Responder {
 
     let mut cmd = Command::new("yt-dlp");
     cmd.args([
-            "--no-playlist",
-            "--no-progress",
-            "--write-thumbnail",
-            "--convert-thumbnails",
-            "jpg",
-            "--ignore-no-formats-error",
-            "--merge-output-format",
-            "mp4",
-            "--print",
-            "after_move:filepath",
-            "-f",
-            &format,
-            "-o",
-            &output_template,
-        ]);
+        "--no-playlist",
+        "--no-progress",
+        "--write-thumbnail",
+        "--convert-thumbnails",
+        "jpg",
+        "--ignore-no-formats-error",
+        "--merge-output-format",
+        "mp4",
+        "--print",
+        "after_move:filepath",
+        "-f",
+        &format,
+        "-o",
+        &output_template,
+    ]);
     if let Some(jar) = platform_cookies(parsed.as_str()) {
         cmd.arg("--cookies").arg(&jar);
     }
@@ -244,19 +244,19 @@ async fn download(body: web::Json<DownloadRequest>) -> impl Responder {
             {
                 let mut retry_cmd = Command::new("yt-dlp");
                 retry_cmd.args([
-                        "--no-playlist",
-                        "--no-progress",
-                        "--write-thumbnail",
-                        "--convert-thumbnails",
-                        "jpg",
-                        "--ignore-no-formats-error",
-                        "--merge-output-format",
-                        "mp4",
-                        "--print",
-                        "after_move:filepath",
-                        "-o",
-                        &output_template,
-                    ]);
+                    "--no-playlist",
+                    "--no-progress",
+                    "--write-thumbnail",
+                    "--convert-thumbnails",
+                    "jpg",
+                    "--ignore-no-formats-error",
+                    "--merge-output-format",
+                    "mp4",
+                    "--print",
+                    "after_move:filepath",
+                    "-o",
+                    &output_template,
+                ]);
                 if let Some(jar) = platform_cookies(parsed.as_str()) {
                     retry_cmd.arg("--cookies").arg(&jar);
                 }
@@ -269,7 +269,10 @@ async fn download(body: web::Json<DownloadRequest>) -> impl Responder {
                             .last()
                             .unwrap_or("Download failed")
                             .to_string();
-                        let msg = public_media_error(&d, "Pullbox couldn’t download media from this link.");
+                        let msg = public_media_error(
+                            &d,
+                            "Pullbox couldn’t download media from this link.",
+                        );
                         return HttpResponse::UnprocessableEntity().json(ErrorBody { error: msg });
                     }
                     Err(e) => {
@@ -279,7 +282,11 @@ async fn download(body: web::Json<DownloadRequest>) -> impl Responder {
                     }
                 }
             } else {
-                let d = detail.lines().last().unwrap_or("Download failed").to_string();
+                let d = detail
+                    .lines()
+                    .last()
+                    .unwrap_or("Download failed")
+                    .to_string();
                 let message = public_media_error(
                     &d,
                     "Pullbox couldn’t download a playable video from this link.",
@@ -310,31 +317,39 @@ async fn download(body: web::Json<DownloadRequest>) -> impl Responder {
     let dir = directory.path();
 
     // Find the largest thumbnail image written by --write-thumbnail (for photo posts)
-    let thumbnail = std::fs::read_dir(dir)
-        .ok()
-        .and_then(|rd| {
-            rd.filter_map(|e| e.ok())
-                .filter(|e| {
-                    let name = e.file_name().to_string_lossy().to_lowercase();
-                    name.ends_with(".jpg") || name.ends_with(".jpeg") || name.ends_with(".png") || name.ends_with(".webp")
-                })
-                .max_by_key(|e| e.metadata().ok().map(|m| m.len()).unwrap_or(0))
-                .map(|e| e.path())
-        });
+    let thumbnail = std::fs::read_dir(dir).ok().and_then(|rd| {
+        rd.filter_map(|e| e.ok())
+            .filter(|e| {
+                let name = e.file_name().to_string_lossy().to_lowercase();
+                name.ends_with(".jpg")
+                    || name.ends_with(".jpeg")
+                    || name.ends_with(".png")
+                    || name.ends_with(".webp")
+            })
+            .max_by_key(|e| e.metadata().ok().map(|m| m.len()).unwrap_or(0))
+            .map(|e| e.path())
+    });
 
     let ext = main_path
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    let is_image_ext = matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "webp" | "heic" | "avif");
+    let is_image_ext = matches!(
+        ext.as_str(),
+        "jpg" | "jpeg" | "png" | "webp" | "heic" | "avif"
+    );
 
     let has_video = if let Ok(probe) = Command::new("ffprobe")
         .args([
-            "-v", "error",
-            "-select_streams", "v:0",
-            "-show_entries", "stream=codec_type",
-            "-of", "csv=p=0",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_type",
+            "-of",
+            "csv=p=0",
             &path,
         ])
         .output()
@@ -347,10 +362,14 @@ async fn download(body: web::Json<DownloadRequest>) -> impl Responder {
 
     let has_audio = if let Ok(probe) = Command::new("ffprobe")
         .args([
-            "-v", "error",
-            "-select_streams", "a:0",
-            "-show_entries", "stream=codec_type",
-            "-of", "csv=p=0",
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=codec_type",
+            "-of",
+            "csv=p=0",
             &path,
         ])
         .output()
@@ -395,15 +414,23 @@ async fn download(body: web::Json<DownloadRequest>) -> impl Responder {
             }
         };
         // Detect content type from extension
-        let ct = if final_image.extension().and_then(|e| e.to_str()).unwrap_or("jpg").to_ascii_lowercase() == "png" {
+        let ct = if final_image
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("jpg")
+            .eq_ignore_ascii_case("png")
+        {
             "image/png"
         } else {
             "image/jpeg"
         };
-        let filename = if ct == "image/png" { "pullbox.jpg".to_string() } else { "pullbox.jpg".to_string() };
+        let filename = "pullbox.jpg".to_string();
         return HttpResponse::Ok()
             .content_type(ct)
-            .insert_header(("Content-Disposition", format!("attachment; filename=\"{}\"", filename)))
+            .insert_header((
+                "Content-Disposition",
+                format!("attachment; filename=\"{}\"", filename),
+            ))
             .body(bytes);
     }
 
@@ -412,19 +439,35 @@ async fn download(body: web::Json<DownloadRequest>) -> impl Responder {
         if let Some(thumb) = thumbnail {
             let compatible_path = dir.join("pullbox-photos.mp4");
             let ffmpeg_out = Command::new("ffmpeg")
-                .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-loop", "1", "-i"])
+                .args([
+                    "-nostdin",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-loop",
+                    "1",
+                    "-i",
+                ])
                 .arg(&thumb)
                 .args(["-i"])
                 .arg(main_path)
                 .args([
-                    "-c:v", "libx264",
-                    "-preset", "veryfast",
-                    "-crf", "21",
-                    "-pix_fmt", "yuv420p",
-                    "-c:a", "aac",
-                    "-b:a", "160k",
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "veryfast",
+                    "-crf",
+                    "21",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "160k",
                     "-shortest",
-                    "-movflags", "+faststart",
+                    "-movflags",
+                    "+faststart",
                 ])
                 .arg(&compatible_path)
                 .output()
@@ -441,11 +484,18 @@ async fn download(body: web::Json<DownloadRequest>) -> impl Responder {
                     };
                     return HttpResponse::Ok()
                         .content_type("video/mp4")
-                        .insert_header(("Content-Disposition", "attachment; filename=\"pullbox.mp4\""))
+                        .insert_header((
+                            "Content-Disposition",
+                            "attachment; filename=\"pullbox.mp4\"",
+                        ))
                         .body(bytes);
                 }
                 Ok(o) => {
-                    let err = String::from_utf8_lossy(&o.stderr).lines().last().unwrap_or("ffmpeg error").to_string();
+                    let err = String::from_utf8_lossy(&o.stderr)
+                        .lines()
+                        .last()
+                        .unwrap_or("ffmpeg error")
+                        .to_string();
                     return HttpResponse::InternalServerError().json(ErrorBody {
                         error: format!("Failed to create video from image + audio: {}", err),
                     });

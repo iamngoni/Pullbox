@@ -29,5 +29,7 @@
 	<string>Pullbox connects to your private downloader backend on your local network.</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
 	<string>Pullbox saves downloaded videos directly to your Photos library.</string>
+	<key>NSSupportsLiveActivities</key>
+	<true/>
 </dict>
 </plist>
