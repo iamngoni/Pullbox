@@ -169,6 +169,8 @@ final class ShareViewController: UIViewController {
             analyzer: APIClient(baseURL: baseURL),
             queue: SystemShareDownloadQueue(
                 baseURL: baseURL,
+                activityManager: PullboxLiveActivityManager.shared,
+                remoteActivityPush: false,
                 backgroundEnqueuer: ShareBackgroundTransferRuntime.shared.enqueuer
             )
         )

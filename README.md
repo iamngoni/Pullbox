@@ -71,15 +71,15 @@ The container joins the existing `media-server_default` network and advertises `
 
 The iPhone app registers an install-level push-to-start token and a per-download update token with the backend. The backend stores them in `PULLBOX_APNS_TOKEN_STORE_PATH`; Docker Compose mounts `/data/live-activity-tokens.json` from the persistent `pullbox-data` volume. The file is written atomically with owner-only (`0600`) permissions. Backend-terminal requests retain a 24-hour tombstone so a late iOS registration cannot recreate an orphaned per-download token; expired tombstones are garbage-collected opportunistically.
 
-APNs is disabled when none of the following variables are present. Supplying only some of them is a startup error:
+Docker Compose optionally loads an untracked `.env` file from the repository/deployment checkout. APNs is disabled only when no APNs variables are present. Any partial configuration is a startup error, and `PULLBOX_APNS_ENVIRONMENT` is mandatory whenever credentials are configured:
 
 - `PULLBOX_APNS_TEAM_ID`
 - `PULLBOX_APNS_KEY_ID`
 - `PULLBOX_APNS_PRIVATE_KEY_PEM`
-- `PULLBOX_APNS_TOPIC` — use `dev.iamngoni.pullbox.push-type.liveactivity`
 - `PULLBOX_APNS_ENVIRONMENT` — `sandbox` for this development-signed device build, `production` for distribution builds
+- `PULLBOX_APNS_TOPIC` — optional; defaults to `dev.iamngoni.pullbox.push-type.liveactivity`
 
-Inject the `.p8` private-key contents through the deployment secret store. Never add the key or an environment file containing it to this repository. The backend reuses each ES256 provider JWT for 50 minutes instead of signing one per progress update.
+Inject the `.p8` private-key contents through the deployment secret store into the host-managed `.env`. Never add the key or that environment file to this repository. The backend reuses each ES256 provider JWT for 50 minutes instead of signing one per progress update.
 
 The server reports media preparation over `0–90%` and leaves the activity active once the response is ready. The iPhone owns `90–99%` for the background response transfer and ends at `100%` only after Photos confirms the save. A successful backend process is therefore never presented as a successful Photos save.
 

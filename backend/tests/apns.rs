@@ -92,6 +92,31 @@ fn start_payload_enforces_the_serialized_apns_byte_limit() {
 }
 
 #[test]
+fn start_payload_trims_the_duplicated_title_before_losing_the_tap_target() {
+    let source_url = format!("https://example.com/?q={}", "\\".repeat(990));
+    let activity = ActivityDescriptor::new(
+        "734B31C0-6CD7-47FB-B769-A03B73C468D2",
+        "\u{0001}".repeat(160),
+        source_url.clone(),
+    );
+
+    let payload = build_start_payload(&activity, 1_725_000_000);
+    let encoded = serde_json::to_vec(&payload).expect("encode payload");
+    let retained_title = payload["aps"]["content-state"]["title"]
+        .as_str()
+        .expect("title");
+
+    assert_eq!(payload["aps"]["attributes"]["sourceURL"], source_url);
+    assert_eq!(payload["aps"]["alert"]["title"], retained_title);
+    assert!(retained_title.chars().count() < 160);
+    assert!(
+        encoded.len() <= 4 * 1024,
+        "payload was {} bytes",
+        encoded.len()
+    );
+}
+
+#[test]
 fn update_payload_reports_fractional_server_download_progress() {
     let activity =
         ActivityDescriptor::new("request-123", "Example clip", "https://example.com/video");
@@ -185,6 +210,46 @@ fn apns_config_is_optional_but_rejects_partial_credentials() {
     assert_eq!(
         error.to_string(),
         "PULLBOX_APNS_TEAM_ID, PULLBOX_APNS_KEY_ID, and PULLBOX_APNS_PRIVATE_KEY_PEM must be set together"
+    );
+}
+
+#[test]
+fn apns_config_rejects_settings_without_credentials() {
+    let configured_environment = ApnsConfig::from_values(
+        None,
+        None,
+        None,
+        None,
+        Some("sandbox".to_string()),
+    );
+
+    let error = match configured_environment {
+        Err(error) => error,
+        Ok(_) => panic!("APNs settings without credentials must fail"),
+    };
+    assert_eq!(
+        error.to_string(),
+        "PULLBOX_APNS_TEAM_ID, PULLBOX_APNS_KEY_ID, and PULLBOX_APNS_PRIVATE_KEY_PEM must be set together"
+    );
+}
+
+#[test]
+fn enabled_apns_requires_an_explicit_environment() {
+    let configured = ApnsConfig::from_values(
+        Some("TEAM123".to_string()),
+        Some("KEY123".to_string()),
+        Some("private-key".to_string()),
+        None,
+        None,
+    );
+
+    let error = match configured {
+        Err(error) => error,
+        Ok(_) => panic!("enabled APNs must require an explicit environment"),
+    };
+    assert_eq!(
+        error.to_string(),
+        "PULLBOX_APNS_ENVIRONMENT must be set when APNs credentials are configured"
     );
 }
 

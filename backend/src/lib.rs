@@ -145,6 +145,13 @@ struct UpdateTokenRequest {
     token: String,
 }
 
+const MAX_REGISTRATION_ID_BYTES: usize = 128;
+
+fn registration_id_is_valid(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty() && value.len() <= MAX_REGISTRATION_ID_BYTES
+}
+
 #[derive(Debug, Serialize)]
 pub struct ErrorBody {
     pub error: String,
@@ -180,9 +187,9 @@ async fn register_push_to_start_token(
             error: "Live Activity token registration is unavailable".to_string(),
         });
     };
-    if body.client_id.trim().is_empty() {
+    if !registration_id_is_valid(&body.client_id) {
         return HttpResponse::BadRequest().json(ErrorBody {
-            error: "clientId must not be empty".to_string(),
+            error: "clientId must be between 1 and 128 bytes".to_string(),
         });
     }
     let token = match apns::DeviceToken::parse(&body.token) {
@@ -194,13 +201,23 @@ async fn register_push_to_start_token(
         }
     };
 
-    if let Err(error) = registry.register_push_to_start(&body.client_id, token) {
-        log::error!("Could not persist Live Activity token: {error}");
-        return HttpResponse::InternalServerError().json(ErrorBody {
-            error: "Could not save Live Activity registration".to_string(),
-        });
+    let registry = registry.get_ref().clone();
+    let client_id = body.client_id.clone();
+    match web::block(move || registry.register_push_to_start(&client_id, token)).await {
+        Ok(Ok(())) => HttpResponse::NoContent().finish(),
+        Ok(Err(error)) => {
+            log::error!("Could not persist Live Activity token: {error}");
+            HttpResponse::InternalServerError().json(ErrorBody {
+                error: "Could not save Live Activity registration".to_string(),
+            })
+        }
+        Err(error) => {
+            log::error!("Live Activity registration worker failed: {error}");
+            HttpResponse::InternalServerError().json(ErrorBody {
+                error: "Could not save Live Activity registration".to_string(),
+            })
+        }
     }
-    HttpResponse::NoContent().finish()
 }
 
 async fn register_update_token(
@@ -212,9 +229,11 @@ async fn register_update_token(
             error: "Live Activity token registration is unavailable".to_string(),
         });
     };
-    if body.client_id.trim().is_empty() || body.request_id.trim().is_empty() {
+    if !registration_id_is_valid(&body.client_id)
+        || !registration_id_is_valid(&body.request_id)
+    {
         return HttpResponse::BadRequest().json(ErrorBody {
-            error: "clientId and requestId must not be empty".to_string(),
+            error: "clientId and requestId must each be between 1 and 128 bytes".to_string(),
         });
     }
     let token = match apns::DeviceToken::parse(&body.token) {
@@ -226,13 +245,24 @@ async fn register_update_token(
         }
     };
 
-    if let Err(error) = registry.register_update(&body.client_id, &body.request_id, token) {
-        log::error!("Could not persist Live Activity token: {error}");
-        return HttpResponse::InternalServerError().json(ErrorBody {
-            error: "Could not save Live Activity registration".to_string(),
-        });
+    let registry = registry.get_ref().clone();
+    let client_id = body.client_id.clone();
+    let request_id = body.request_id.clone();
+    match web::block(move || registry.register_update(&client_id, &request_id, token)).await {
+        Ok(Ok(())) => HttpResponse::NoContent().finish(),
+        Ok(Err(error)) => {
+            log::error!("Could not persist Live Activity token: {error}");
+            HttpResponse::InternalServerError().json(ErrorBody {
+                error: "Could not save Live Activity registration".to_string(),
+            })
+        }
+        Err(error) => {
+            log::error!("Live Activity registration worker failed: {error}");
+            HttpResponse::InternalServerError().json(ErrorBody {
+                error: "Could not save Live Activity registration".to_string(),
+            })
+        }
     }
-    HttpResponse::NoContent().finish()
 }
 
 async fn health() -> impl Responder {

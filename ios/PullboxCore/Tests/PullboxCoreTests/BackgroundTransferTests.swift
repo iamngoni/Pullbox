@@ -60,6 +60,33 @@ import Testing
     #expect(try store.load().first?.status == .preparing)
 }
 
+@Test func localActivityHandoffDoesNotAlsoRequestRemotePushStart() async throws {
+    let tmp = FileManager.default.temporaryDirectory
+        .appending(path: "pullbox-local-activity-(UUID().uuidString).json")
+    defer { try? FileManager.default.removeItem(at: tmp) }
+    let store = FileQueueStore(fileURL: tmp)
+    let sourceURL = try #require(URL(string: "https://example.com/video"))
+    let baseURL = try #require(URL(string: "https://example.com"))
+    let enqueuer = MockBackgroundEnqueuer()
+
+    _ = try await BackgroundDownloadHandoff.enqueueAndNotify(
+        sourceURL: sourceURL,
+        title: "Local activity",
+        store: store,
+        activityManager: MockLiveActivityManager(),
+        baseURL: baseURL,
+        remoteActivityPush: false,
+        backgroundEnqueuer: enqueuer
+    )
+
+    let request = try #require(enqueuer.requests.first)
+    let body = try #require(request.httpBody)
+    let json = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
+    #expect(json["requestId"] == nil)
+    #expect(json["title"] == nil)
+    #expect(json["clientId"] == nil)
+}
+
 @Test func backgroundHandoffInvalidURLThrowsWithoutStartingActivity() async throws {
     let tmp = FileManager.default.temporaryDirectory
         .appending(path: "pullbox-bg2-\(UUID().uuidString).json")
@@ -396,6 +423,334 @@ import Testing
     #expect(Set(items.compactMap(\.title)).count == 40)
 }
 
+@Test func recoveryDoesNotSaveToPhotosTwiceAfterTerminalQueueWriteFailure() async throws {
+    #if canImport(Darwin)
+    let root = FileManager.default.temporaryDirectory
+        .appending(path: "pullbox-terminal-failure-\(UUID().uuidString)", directoryHint: .isDirectory)
+    let queueDirectory = root.appending(path: "queue", directoryHint: .isDirectory)
+    let stagingDirectory = root.appending(path: "background-downloads", directoryHint: .isDirectory)
+    defer {
+        try? FileManager.default.setAttributes(
+            [.posixPermissions: 0o700],
+            ofItemAtPath: queueDirectory.path
+        )
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    let store = FileQueueStore(fileURL: queueDirectory.appending(path: "queue.json"))
+    let sourceURL = try #require(URL(string: "https://example.com/video"))
+    let item = try store.enqueue(sourceURL: sourceURL)
+    let callbackFile = root.appending(path: "callback.tmp")
+    try Data("video".utf8).write(to: callbackFile)
+    let response = try #require(HTTPURLResponse(
+        url: sourceURL,
+        statusCode: 200,
+        httpVersion: nil,
+        headerFields: ["Content-Type": "video/mp4"]
+    ))
+    let stager = DownloadedFileStager(directory: stagingDirectory)
+    let payload = try stager.stage(fileAt: callbackFile, taskID: item.id, response: response)
+    let journal = StagedTransferJournal(directory: stagingDirectory)
+    try journal.record(taskID: item.id, payloadURL: payload, response: response, errorDescription: nil)
+    let saver = FirstSaveBlocksQueuePhotoSaver(queueDirectory: queueDirectory)
+    let first = PullboxBackgroundSessionDelegate(
+        store: store,
+        activityManager: MockLiveActivityManager(),
+        photoSaver: saver,
+        fileStager: stager,
+        transferJournal: journal
+    )
+
+    await first.recoverPendingDownloads()
+    #expect(await saver.saveCount == 1)
+    #expect(try journal.pendingReceipts().count == 1)
+
+    try FileManager.default.setAttributes(
+        [.posixPermissions: 0o700],
+        ofItemAtPath: queueDirectory.path
+    )
+    let fresh = PullboxBackgroundSessionDelegate(
+        store: store,
+        activityManager: MockLiveActivityManager(),
+        photoSaver: saver,
+        fileStager: stager,
+        transferJournal: journal
+    )
+    await fresh.recoverPendingDownloads()
+
+    #expect(await saver.saveCount == 1)
+    #expect(try store.load().first?.status == .succeeded)
+    #expect(try FileManager.default.contentsOfDirectory(atPath: stagingDirectory.path).isEmpty)
+    #endif
+}
+
+@Test func recoveryPreservesPayloadWhenQueueTransitionCannotPersist() async throws {
+    #if canImport(Darwin)
+    let root = FileManager.default.temporaryDirectory
+        .appending(path: "pullbox-queue-failure-\(UUID().uuidString)", directoryHint: .isDirectory)
+    let queueDirectory = root.appending(path: "queue", directoryHint: .isDirectory)
+    let stagingDirectory = root.appending(path: "background-downloads", directoryHint: .isDirectory)
+    defer {
+        try? FileManager.default.setAttributes(
+            [.posixPermissions: 0o700],
+            ofItemAtPath: queueDirectory.path
+        )
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    let store = FileQueueStore(fileURL: queueDirectory.appending(path: "queue.json"))
+    let sourceURL = try #require(URL(string: "https://example.com/video"))
+    let item = try store.enqueue(sourceURL: sourceURL)
+    let callbackFile = root.appending(path: "callback.tmp")
+    try Data("video".utf8).write(to: callbackFile)
+    let response = try #require(HTTPURLResponse(
+        url: sourceURL,
+        statusCode: 200,
+        httpVersion: nil,
+        headerFields: ["Content-Type": "video/mp4"]
+    ))
+    let stager = DownloadedFileStager(directory: stagingDirectory)
+    let payload = try stager.stage(fileAt: callbackFile, taskID: item.id, response: response)
+    let journal = StagedTransferJournal(directory: stagingDirectory)
+    try journal.record(taskID: item.id, payloadURL: payload, response: response, errorDescription: nil)
+    try FileManager.default.setAttributes(
+        [.posixPermissions: 0o500],
+        ofItemAtPath: queueDirectory.path
+    )
+    let saver = SlowCountingPhotoSaver()
+    let delegate = PullboxBackgroundSessionDelegate(
+        store: store,
+        activityManager: MockLiveActivityManager(),
+        photoSaver: saver,
+        fileStager: stager,
+        transferJournal: journal
+    )
+
+    await delegate.recoverPendingDownloads()
+
+    #expect(await saver.saveCount == 0)
+    #expect(FileManager.default.fileExists(atPath: payload.path))
+    #expect(try journal.pendingReceipts().count == 1)
+    #endif
+}
+
+@Test func recoveryDiscoversPayloadLeftBeforeReceiptWrite() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appending(path: "pullbox-orphan-\(UUID().uuidString)", directoryHint: .isDirectory)
+    let queueFile = root.appending(path: "queue.json")
+    let stagingDirectory = root.appending(path: "background-downloads", directoryHint: .isDirectory)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let store = FileQueueStore(fileURL: queueFile)
+    let sourceURL = try #require(URL(string: "https://example.com/video"))
+    let item = try store.enqueue(sourceURL: sourceURL)
+    try FileManager.default.createDirectory(at: stagingDirectory, withIntermediateDirectories: true)
+    let orphanedPayload = stagingDirectory.appending(path: "\(item.id.uuidString).mp4")
+    try Data("video".utf8).write(to: orphanedPayload)
+    try FileManager.default.setAttributes(
+        [.modificationDate: Date().addingTimeInterval(-10)],
+        ofItemAtPath: orphanedPayload.path
+    )
+    let saver = RecordingPhotoSaver()
+    let delegate = PullboxBackgroundSessionDelegate(
+        store: store,
+        activityManager: MockLiveActivityManager(),
+        photoSaver: saver,
+        fileStager: DownloadedFileStager(directory: stagingDirectory),
+        transferJournal: StagedTransferJournal(directory: stagingDirectory)
+    )
+
+    await delegate.recoverPendingDownloads()
+
+    #expect(await saver.savedURLs == [orphanedPayload])
+    #expect(try store.load().first?.status == .succeeded)
+    #expect(try FileManager.default.contentsOfDirectory(atPath: stagingDirectory.path).isEmpty)
+}
+
+@Test func concurrentRecoveryClaimsEachReceiptOnlyOnce() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appending(path: "pullbox-claim-\(UUID().uuidString)", directoryHint: .isDirectory)
+    let queueFile = root.appending(path: "queue.json")
+    let stagingDirectory = root.appending(path: "background-downloads", directoryHint: .isDirectory)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let store = FileQueueStore(fileURL: queueFile)
+    let sourceURL = try #require(URL(string: "https://example.com/video"))
+    let item = try store.enqueue(sourceURL: sourceURL)
+    let callbackFile = root.appending(path: "callback.tmp")
+    try Data("video".utf8).write(to: callbackFile)
+    let response = try #require(HTTPURLResponse(
+        url: sourceURL,
+        statusCode: 200,
+        httpVersion: nil,
+        headerFields: ["Content-Type": "video/mp4"]
+    ))
+    let stager = DownloadedFileStager(directory: stagingDirectory)
+    let payload = try stager.stage(fileAt: callbackFile, taskID: item.id, response: response)
+    let journal = StagedTransferJournal(directory: stagingDirectory)
+    try journal.record(taskID: item.id, payloadURL: payload, response: response, errorDescription: nil)
+    let saver = SlowCountingPhotoSaver()
+    let first = PullboxBackgroundSessionDelegate(
+        store: store,
+        activityManager: MockLiveActivityManager(),
+        photoSaver: saver,
+        fileStager: stager,
+        transferJournal: journal
+    )
+    let second = PullboxBackgroundSessionDelegate(
+        store: store,
+        activityManager: MockLiveActivityManager(),
+        photoSaver: saver,
+        fileStager: stager,
+        transferJournal: journal
+    )
+
+    async let firstRecovery: Void = first.recoverPendingDownloads()
+    async let secondRecovery: Void = second.recoverPendingDownloads()
+    _ = await (firstRecovery, secondRecovery)
+
+    #expect(await saver.saveCount == 1)
+    #expect(try store.load().first?.status == .succeeded)
+}
+
+@Test func freshDelegateRecoversJournaledTransportFailure() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appending(path: "pullbox-error-recovery-\(UUID().uuidString)", directoryHint: .isDirectory)
+    let queueFile = root.appending(path: "queue.json")
+    let stagingDirectory = root.appending(path: "background-downloads", directoryHint: .isDirectory)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let store = FileQueueStore(fileURL: queueFile)
+    let sourceURL = try #require(URL(string: "https://example.com/video"))
+    let item = try store.enqueue(sourceURL: sourceURL)
+    let journal = StagedTransferJournal(directory: stagingDirectory)
+    let firstDelegate = PullboxBackgroundSessionDelegate(
+        store: store,
+        fileStager: DownloadedFileStager(directory: stagingDirectory),
+        transferJournal: journal
+    )
+    let transportError = NSError(
+        domain: NSURLErrorDomain,
+        code: NSURLErrorNetworkConnectionLost,
+        userInfo: [NSLocalizedDescriptionKey: "connection lost"]
+    )
+
+    try firstDelegate.recordTransportFailure(
+        taskDescription: item.id.uuidString,
+        response: nil,
+        error: transportError
+    )
+
+    let freshDelegate = PullboxBackgroundSessionDelegate(
+        store: store,
+        activityManager: MockLiveActivityManager(),
+        photoSaver: MockPhotoSaver(shouldFail: false),
+        fileStager: DownloadedFileStager(directory: stagingDirectory),
+        transferJournal: journal
+    )
+    await freshDelegate.recoverPendingDownloads()
+
+    guard case .failed(let message) = try store.load().first?.status else {
+        Issue.record("Expected a failed queue item")
+        return
+    }
+    #expect(message == "connection lost")
+    #expect(try FileManager.default.contentsOfDirectory(atPath: stagingDirectory.path).isEmpty)
+}
+
+@Test func delegateStagesAndJournalsBeforeReturningFromDownloadCallback() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appending(path: "pullbox-journal-\(UUID().uuidString)", directoryHint: .isDirectory)
+    let stagingDirectory = root.appending(path: "background-downloads", directoryHint: .isDirectory)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let taskID = UUID()
+    let sourceURL = try #require(URL(string: "https://example.com/video"))
+    let callbackFile = root.appending(path: "callback.tmp")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    try Data("video".utf8).write(to: callbackFile)
+    let response = try #require(HTTPURLResponse(
+        url: sourceURL,
+        statusCode: 200,
+        httpVersion: nil,
+        headerFields: ["Content-Type": "video/mp4"]
+    ))
+    let stager = DownloadedFileStager(directory: stagingDirectory)
+    let journal = StagedTransferJournal(directory: stagingDirectory)
+    let delegate = PullboxBackgroundSessionDelegate(
+        fileStager: stager,
+        transferJournal: journal
+    )
+
+    let payload = try delegate.stageDownloadedFile(
+        taskDescription: taskID.uuidString,
+        response: response,
+        location: callbackFile
+    )
+
+    #expect(FileManager.default.fileExists(atPath: payload.path))
+    let receipts = try journal.pendingReceipts()
+    #expect(receipts.count == 1)
+    let receipt = try #require(receipts.first)
+    #expect(receipt.taskID == taskID)
+    #expect(receipt.payloadFilename == payload.lastPathComponent)
+    #expect(receipt.statusCode == 200)
+}
+
+@Test func freshDelegateRecoversReceiptLeftByTerminatedExtension() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appending(path: "pullbox-recovery-\(UUID().uuidString)", directoryHint: .isDirectory)
+    let queueFile = root.appending(path: "queue.json")
+    let stagingDirectory = root.appending(path: "background-downloads", directoryHint: .isDirectory)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let store = FileQueueStore(fileURL: queueFile)
+    let sourceURL = try #require(URL(string: "https://example.com/video"))
+    let item = try store.enqueue(sourceURL: sourceURL)
+    let temporaryPayload = root.appending(path: "callback.tmp")
+    try Data("video".utf8).write(to: temporaryPayload)
+    let response = try #require(HTTPURLResponse(
+        url: sourceURL,
+        statusCode: 200,
+        httpVersion: nil,
+        headerFields: ["Content-Type": "video/mp4"]
+    ))
+    let stager = DownloadedFileStager(directory: stagingDirectory)
+    let payload = try stager.stage(fileAt: temporaryPayload, taskID: item.id, response: response)
+    let journal = StagedTransferJournal(directory: stagingDirectory)
+    try journal.record(taskID: item.id, payloadURL: payload, response: response, errorDescription: nil)
+
+    let saver = RecordingPhotoSaver()
+    let freshDelegate = PullboxBackgroundSessionDelegate(
+        store: store,
+        activityManager: MockLiveActivityManager(),
+        photoSaver: saver,
+        fileStager: stager,
+        transferJournal: journal
+    )
+
+    await freshDelegate.recoverPendingDownloads()
+
+    #expect(try store.load().first?.status == .succeeded)
+    #expect(await saver.savedURLs == [payload])
+    #expect(!FileManager.default.fileExists(atPath: payload.path))
+    let leftovers = try FileManager.default.contentsOfDirectory(atPath: stagingDirectory.path)
+    #expect(leftovers.isEmpty)
+}
+
+@Test func hostReleasesBackgroundSessionAfterDrainedEvents() {
+    let owner = BackgroundSessionOwnership()
+    let session = MockBackgroundSessionInvalidator()
+
+    owner.retain(session)
+    #expect(owner.hasRetainedSession)
+
+    owner.finishAndRelease()
+
+    #expect(session.finishCalls == 1)
+    #expect(!owner.hasRetainedSession)
+}
+
 // MARK: - Mocks
 
 actor MockLiveActivityManager: LiveActivityControlling {
@@ -475,6 +830,61 @@ final class LockedIntegers: @unchecked Sendable {
 
     func append(_ value: Int) {
         lock.withLock { storedValues.append(value) }
+    }
+}
+
+final class MockBackgroundSessionInvalidator: BackgroundSessionInvalidating, @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedFinishCalls = 0
+
+    var finishCalls: Int {
+        lock.withLock { storedFinishCalls }
+    }
+
+    func finishTasksAndInvalidate() {
+        lock.withLock { storedFinishCalls += 1 }
+    }
+}
+
+actor FirstSaveBlocksQueuePhotoSaver: PhotoLibrarySaving {
+    private let queueDirectory: URL
+    private(set) var saveCount = 0
+
+    init(queueDirectory: URL) {
+        self.queueDirectory = queueDirectory
+    }
+
+    func save(at url: URL) async throws {
+        saveCount += 1
+        if saveCount == 1 {
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o500],
+                ofItemAtPath: queueDirectory.path
+            )
+        }
+    }
+}
+
+actor SlowCountingPhotoSaver: PhotoLibrarySaving {
+    private(set) var saveCount = 0
+
+    func save(at url: URL) async throws {
+        saveCount += 1
+        try await Task.sleep(for: .milliseconds(50))
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            throw NSError(domain: "test", code: 2, userInfo: [NSLocalizedDescriptionKey: "missing file"])
+        }
+    }
+}
+
+actor RecordingPhotoSaver: PhotoLibrarySaving {
+    private(set) var savedURLs: [URL] = []
+
+    func save(at url: URL) async throws {
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            throw NSError(domain: "test", code: 2, userInfo: [NSLocalizedDescriptionKey: "missing file"])
+        }
+        savedURLs.append(url)
     }
 }
 

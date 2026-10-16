@@ -5,7 +5,10 @@ use pullbox_backend::apns::{
     ActivityNotificationContext, ActivityNotifier, ActivityNotifierHandle, ApnsSendError,
     DownloadNotificationSession, NotificationOutcome,
 };
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 struct RecordingNotifier {
     events: Mutex<Vec<String>>,
@@ -55,6 +58,66 @@ impl ActivityNotifier for RecordingNotifier {
     }
 }
 
+struct BlockingNotifier;
+
+#[async_trait]
+impl ActivityNotifier for BlockingNotifier {
+    async fn start(
+        &self,
+        _context: &ActivityNotificationContext,
+        _timestamp: i64,
+    ) -> Result<NotificationOutcome, ApnsSendError> {
+        std::future::pending().await
+    }
+
+    async fn progress(
+        &self,
+        _context: &ActivityNotificationContext,
+        _progress: f64,
+        _timestamp: i64,
+    ) -> Result<NotificationOutcome, ApnsSendError> {
+        std::future::pending().await
+    }
+
+    async fn ready(
+        &self,
+        _context: &ActivityNotificationContext,
+        _timestamp: i64,
+    ) -> Result<NotificationOutcome, ApnsSendError> {
+        std::future::pending().await
+    }
+
+    async fn failed(
+        &self,
+        _context: &ActivityNotificationContext,
+        _message: &str,
+        _timestamp: i64,
+    ) -> Result<NotificationOutcome, ApnsSendError> {
+        std::future::pending().await
+    }
+}
+
+#[actix_rt::test]
+async fn apns_delivery_never_blocks_the_media_response_lifecycle() {
+    let context = ActivityNotificationContext::new(
+        "client-blocked",
+        "request-blocked",
+        "Blocked APNs",
+        "https://example.com/video",
+    );
+    let handle = ActivityNotifierHandle::new(Arc::new(BlockingNotifier));
+
+    let session = actix_rt::time::timeout(
+        Duration::from_millis(50),
+        DownloadNotificationSession::begin(Some(context), Some(handle)),
+    )
+    .await
+    .expect("APNs start blocked the media lifecycle");
+    actix_rt::time::timeout(Duration::from_millis(50), session.ready())
+        .await
+        .expect("APNs ready blocked the media lifecycle");
+}
+
 #[actix_rt::test]
 async fn download_notification_session_starts_then_reports_progress_and_server_ready() {
     let recorder = Arc::new(RecordingNotifier {
@@ -71,6 +134,19 @@ async fn download_notification_session_starts_then_reports_progress_and_server_r
     let session = DownloadNotificationSession::begin(Some(context), Some(handle)).await;
     session.progress(0.45).await;
     session.ready().await;
+
+    for _ in 0..100 {
+        if recorder
+            .events
+            .lock()
+            .unwrap()
+            .last()
+            .is_some_and(|event| event == "ready")
+        {
+            break;
+        }
+        actix_rt::time::sleep(Duration::from_millis(10)).await;
+    }
 
     assert_eq!(
         *recorder.events.lock().unwrap(),

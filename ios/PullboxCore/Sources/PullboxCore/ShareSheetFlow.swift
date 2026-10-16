@@ -17,17 +17,20 @@ public struct SystemShareDownloadQueue: ShareDownloadQueueing {
     private let baseURL: URL
     private let store: FileQueueStore?
     private let activityManager: (any LiveActivityControlling)?
+    private let remoteActivityPush: Bool
     private let backgroundEnqueuer: any BackgroundTransferEnqueuer
 
     public init(
         baseURL: URL,
         store: FileQueueStore? = nil,
         activityManager: (any LiveActivityControlling)? = nil,
+        remoteActivityPush: Bool = true,
         backgroundEnqueuer: any BackgroundTransferEnqueuer
     ) {
         self.baseURL = baseURL
         self.store = store
         self.activityManager = activityManager
+        self.remoteActivityPush = remoteActivityPush
         self.backgroundEnqueuer = backgroundEnqueuer
     }
 
@@ -39,6 +42,7 @@ public struct SystemShareDownloadQueue: ShareDownloadQueueing {
             store: store,
             activityManager: activityManager,
             baseURL: baseURL,
+            remoteActivityPush: remoteActivityPush,
             backgroundEnqueuer: backgroundEnqueuer
         )
     }

@@ -391,7 +391,7 @@ struct ContentView: View {
             }
             .buttonStyle(.borderedProminent)
             .buttonBorderShape(.roundedRectangle(radius: 16))
-            .disabled(phase.isBusy || phase == .success)
+            .disabled(phase.isBusy || phase == .queued || phase == .success)
 
             Button("Replace link", systemImage: "arrow.triangle.2.circlepath", action: replaceLink)
                 .font(.headline)
@@ -427,6 +427,17 @@ struct ContentView: View {
                 .padding(16)
                 .background(Color(hex: 0x1EB98F).opacity(0.1), in: RoundedRectangle(cornerRadius: 16))
                 .transition(.scale.combined(with: .opacity))
+        case .queued:
+            HStack(spacing: 12) {
+                Image(systemName: "arrow.down.circle.fill")
+                    .font(.title2)
+                    .foregroundStyle(Color.accentColor)
+                Text("Download started in the background")
+                    .font(.headline)
+                Spacer()
+            }
+            .padding(16)
+            .background(Color.accentColor.opacity(0.1), in: RoundedRectangle(cornerRadius: 16))
         case .failure(let message):
             Label(message, systemImage: "exclamationmark.triangle.fill")
                 .font(.subheadline.weight(.medium))
@@ -476,12 +487,19 @@ struct ContentView: View {
         Task {
             do {
                 let sourceURL = try validatedSourceURL()
-                let client = try makeClient()
-                let localURL = try await client.download(sourceURL: sourceURL)
-                phase = .saving
-                try await PhotoSaver.save(at: localURL)
-                try? FileManager.default.removeItem(at: localURL)
-                withAnimation(.spring(response: 0.35)) { phase = .success }
+                guard let baseURL = URL(string: serverURL),
+                      ["http", "https"].contains(baseURL.scheme?.lowercased()),
+                      let appDelegate = AppDelegate.shared else {
+                    throw AppError.invalidServer
+                }
+
+                _ = try await appDelegate.enqueueDownload(
+                    sourceURL: sourceURL,
+                    title: media?.title,
+                    baseURL: baseURL
+                )
+                phase = .queued
+                reloadQueue()
             } catch {
                 phase = .failure(error.localizedDescription)
             }
@@ -557,7 +575,7 @@ private struct SettingsView: View {
 }
 
 private enum Phase: Equatable {
-    case idle, analyzing, downloading, saving, success, failure(String)
+    case idle, analyzing, downloading, saving, queued, success, failure(String)
 
     var isBusy: Bool {
         self == .analyzing || self == .downloading || self == .saving
@@ -567,6 +585,7 @@ private enum Phase: Equatable {
         switch self {
         case .downloading: "Downloading…"
         case .saving: "Saving to Photos…"
+        case .queued: "Download queued"
         case .success: "Saved to Photos"
         default: "Save to Photos"
         }

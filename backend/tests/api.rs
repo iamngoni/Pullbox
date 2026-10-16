@@ -149,6 +149,45 @@ async fn registration_endpoints_reject_malformed_tokens_without_echoing_them() {
 }
 
 #[actix_rt::test]
+async fn registration_endpoints_reject_oversized_identifiers() {
+    let registry = TokenRegistry::default();
+    let app = test::init_service(
+        App::new()
+            .app_data(web::Data::new(registry.clone()))
+            .configure(configure),
+    )
+    .await;
+    let oversized = "x".repeat(1_024);
+    let cases = [
+        (
+            "/api/live-activity/push-to-start-token",
+            serde_json::json!({"clientId": oversized, "token": "aabbccdd"}),
+        ),
+        (
+            "/api/live-activity/update-token",
+            serde_json::json!({
+                "clientId": "client-123",
+                "requestId": "x".repeat(1_024),
+                "token": "11223344"
+            }),
+        ),
+    ];
+
+    for (uri, body) in cases {
+        let request = test::TestRequest::post()
+            .uri(uri)
+            .set_json(body)
+            .to_request();
+        let response = test::call_service(&app, request).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    assert!(registry.push_to_start(&"x".repeat(1_024)).is_none());
+    assert!(registry
+        .update_token("client-123", &"x".repeat(1_024))
+        .is_none());
+}
+
+#[actix_rt::test]
 async fn json_requests_above_sixteen_kib_are_rejected_before_deserialization() {
     let registry = TokenRegistry::default();
     let app = test::init_service(

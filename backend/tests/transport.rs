@@ -221,6 +221,46 @@ async fn first_update_waits_for_the_token_registered_after_push_start() {
 }
 
 #[actix_rt::test]
+async fn unrelated_registration_does_not_end_wait_for_the_requested_token() {
+    use std::time::Duration;
+
+    let registry = TokenRegistry::default();
+    let waiting_registry = registry.clone();
+    let pending = actix_rt::spawn(async move {
+        waiting_registry
+            .wait_for_update_token("client", "request-b", Duration::from_secs(1))
+            .await
+    });
+
+    actix_rt::time::sleep(Duration::from_millis(20)).await;
+    registry
+        .register_update(
+            "client",
+            "request-a",
+            DeviceToken::parse("11223344").unwrap(),
+        )
+        .unwrap();
+    actix_rt::time::sleep(Duration::from_millis(20)).await;
+
+    assert!(
+        !pending.is_finished(),
+        "an unrelated token ended request-b's wait"
+    );
+    registry
+        .register_update(
+            "client",
+            "request-b",
+            DeviceToken::parse("55667788").unwrap(),
+        )
+        .unwrap();
+    let token = pending
+        .await
+        .expect("wait task")
+        .expect("request-b token");
+    assert_eq!(token.as_str(), "55667788");
+}
+
+#[actix_rt::test]
 async fn ready_without_a_token_prevents_late_registration_from_leaking() {
     let registry = TokenRegistry::default();
     let transport = Arc::new(FakeTransport {

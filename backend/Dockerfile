@@ -15,6 +15,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/pullbox-backend /usr/local/bin/pullbox-backend
+RUN install -d -o nobody -g nogroup -m 0700 /data
 
 ENV PULLBOX_BIND=0.0.0.0:8787
 ENV RUST_LOG=info

@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 
 #if canImport(ActivityKit) && os(iOS)
 import ActivityKit
@@ -78,6 +79,7 @@ public actor PullboxLiveActivityManager: LiveActivityControlling {
 
     // In-memory fallback for platforms without ActivityKit or for tests
     private var activeIDs: Set<String> = []
+    private let logger = Logger(subsystem: "dev.iamngoni.pullbox", category: "LiveActivity")
 
     public init() {}
 
@@ -92,19 +94,25 @@ public actor PullboxLiveActivityManager: LiveActivityControlling {
             }) {
                 activeIDs.insert(item.id.uuidString)
                 await existing.update(ActivityContent(state: state, staleDate: nil))
+                logger.info("Reused Live Activity for download \(item.id.uuidString, privacy: .public)")
                 return
             }
-            if ActivityAuthorizationInfo().areActivitiesEnabled {
-                do {
-                    _ = try Activity<PullboxDownloadAttributes>.request(
-                        attributes: attributes,
-                        content: ActivityContent(state: state, staleDate: nil)
-                    )
-                    activeIDs.insert(item.id.uuidString)
-                    return
-                } catch {
-                    // Fall through to in-memory tracking; do not throw on Activity failure
-                }
+            guard ActivityAuthorizationInfo().areActivitiesEnabled else {
+                logger.error("Live Activities are disabled for this app; using notification fallback for \(item.id.uuidString, privacy: .public)")
+                activeIDs.insert(item.id.uuidString)
+                await postNotification(for: item, state: state)
+                return
+            }
+            do {
+                _ = try Activity<PullboxDownloadAttributes>.request(
+                    attributes: attributes,
+                    content: ActivityContent(state: state, staleDate: nil)
+                )
+                activeIDs.insert(item.id.uuidString)
+                logger.info("Started Live Activity for download \(item.id.uuidString, privacy: .public)")
+                return
+            } catch {
+                logger.error("ActivityKit rejected Live Activity start for \(item.id.uuidString, privacy: .public): \(String(describing: error), privacy: .public)")
             }
         }
         #endif
@@ -129,7 +137,7 @@ public actor PullboxLiveActivityManager: LiveActivityControlling {
         if #available(iOS 16.1, *) {
             for activity in Activity<PullboxDownloadAttributes>.activities where activity.attributes.id == item.id.uuidString {
                 await activity.update(ActivityContent(state: state, staleDate: nil))
-                await postNotification(for: item, state: state)
+                activeIDs.insert(item.id.uuidString)
                 return
             }
         }
@@ -162,7 +170,6 @@ public actor PullboxLiveActivityManager: LiveActivityControlling {
                 }
                 await activity.end(ActivityContent(state: state, staleDate: nil), dismissalPolicy: dismissal)
                 activeIDs.remove(item.id.uuidString)
-                await postNotification(for: item, state: state)
                 return
             }
         }
@@ -236,8 +243,9 @@ public enum BackgroundDownloadHandoff {
     }
 
     /// Async handoff for the share extension: durably enqueue, create/resume the
-    /// system-owned background transfer, persist preparing, and return. A local
-    /// ActivityKit surface is opt-in; the normal share path uses APNs push-to-start.
+    /// system-owned background transfer, persist preparing, and return. A supplied
+    /// ActivityKit manager starts the activity locally; callers without
+    /// one can use the remote push-to-start path instead.
     /// Throws without persisting on invalid URL or persistence failure.
     @discardableResult
     public static func enqueueAndNotify(
@@ -248,6 +256,7 @@ public enum BackgroundDownloadHandoff {
         activityManager: LiveActivityControlling? = nil,
         baseURL: URL? = nil,
         clientID: String? = nil,
+        remoteActivityPush: Bool = true,
         backgroundEnqueuer: BackgroundTransferEnqueuer
     ) async throws -> QueuedDownload {
         let targetStore = store ?? sharedStore
@@ -257,12 +266,14 @@ public enum BackgroundDownloadHandoff {
         // If this handoff fails, remove the queue record so the extension never reports a
         // download as queued when no process owns the transfer.
         let resolvedBase = baseURL ?? resolveBaseURL()
-        let resolvedClientID = clientID ?? PullboxClientIdentityStore().clientID()
+        let resolvedClientID = remoteActivityPush
+            ? (clientID ?? PullboxClientIdentityStore().clientID())
+            : nil
         do {
             let request = try APIRequestBuilder(baseURL: resolvedBase).download(
                 sourceURL: sourceURL,
-                requestID: item.id,
-                title: item.title,
+                requestID: remoteActivityPush ? item.id : nil,
+                title: remoteActivityPush ? item.title : nil,
                 clientID: resolvedClientID
             )
             try backgroundEnqueuer.enqueueBackgroundDownload(for: item, request: request)

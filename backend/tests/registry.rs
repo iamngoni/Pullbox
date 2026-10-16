@@ -85,6 +85,44 @@ fn registry_accepts_concurrent_registrations_without_losing_entries() {
 }
 
 #[test]
+fn registry_capacity_is_bounded_but_existing_tokens_can_rotate() {
+    let registry = TokenRegistry::with_limits(2, 2);
+    registry
+        .register_push_to_start("client-a", DeviceToken::parse("0011").unwrap())
+        .unwrap();
+    registry
+        .register_push_to_start("client-b", DeviceToken::parse("2233").unwrap())
+        .unwrap();
+
+    assert!(registry
+        .register_push_to_start("client-c", DeviceToken::parse("4455").unwrap())
+        .is_err());
+    registry
+        .register_push_to_start("client-a", DeviceToken::parse("6677").unwrap())
+        .expect("existing push token rotates at capacity");
+    assert_eq!(
+        registry
+            .push_to_start("client-a")
+            .expect("rotated start token")
+            .as_str(),
+        "6677"
+    );
+
+    registry
+        .register_update("client-a", "request-a", DeviceToken::parse("0011").unwrap())
+        .unwrap();
+    registry
+        .register_update("client-a", "request-b", DeviceToken::parse("2233").unwrap())
+        .unwrap();
+    assert!(registry
+        .register_update("client-a", "request-c", DeviceToken::parse("4455").unwrap())
+        .is_err());
+    registry
+        .register_update("client-a", "request-a", DeviceToken::parse("8899").unwrap())
+        .expect("existing update token rotates at capacity");
+}
+
+#[test]
 fn terminal_request_rejects_a_late_update_token_without_persisting_it() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let path = directory.path().join("activity-tokens.json");
@@ -219,6 +257,61 @@ fn persistent_registry_secures_an_existing_permissive_token_file() {
             & 0o777,
         0o600
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn persistent_registry_rejects_a_symlinked_token_store() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let target = directory.path().join("target.json");
+    let path = directory.path().join("activity-tokens.json");
+    std::fs::write(&target, r#"{"push_to_start":{},"updates":{}}"#)
+        .expect("seed target token file");
+    symlink(&target, &path).expect("create token-store symlink");
+
+    assert!(
+        TokenRegistry::persistent(path).is_err(),
+        "token registry followed a symlinked store"
+    );
+}
+
+#[test]
+fn persistent_registry_migrates_oversized_identifier_keys() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("activity-tokens.json");
+    let oversized = "x".repeat(1_024);
+    let fixture = serde_json::json!({
+        "push_to_start": {
+            "valid-client": "0011",
+            oversized.clone(): "2233"
+        },
+        "updates": {
+            "valid-client": {"valid-request": "4455", oversized.clone(): "6677"},
+            oversized.clone(): {"valid-request": "8899"}
+        },
+        "terminal_requests": {
+            oversized.clone(): {"valid-request": i64::MAX},
+            "valid-client": {oversized.clone(): i64::MAX}
+        }
+    });
+    std::fs::write(&path, serde_json::to_vec(&fixture).unwrap()).expect("seed legacy store");
+
+    let registry = TokenRegistry::persistent(&path).expect("migrated registry");
+
+    assert!(registry.push_to_start(&oversized).is_none());
+    assert!(registry.update_token("valid-client", &oversized).is_none());
+    assert!(registry.update_token(&oversized, "valid-request").is_none());
+    let rewritten: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path).expect("rewritten store")).unwrap();
+    assert!(rewritten["push_to_start"].get(&oversized).is_none());
+    assert!(rewritten["updates"].get(&oversized).is_none());
+    assert!(rewritten["updates"]["valid-client"].get(&oversized).is_none());
+    assert!(rewritten["terminal_requests"].get(&oversized).is_none());
+    assert!(rewritten["terminal_requests"]["valid-client"]
+        .get(&oversized)
+        .is_none());
 }
 
 #[test]

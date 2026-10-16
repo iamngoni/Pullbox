@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#endif
 #if canImport(Photos) && os(iOS)
 import Photos
 #endif
@@ -129,6 +132,212 @@ public struct DownloadedFileStager: Sendable {
         if contentType.hasPrefix("image/") { return "jpg" }
         if contentType.contains("video/quicktime") { return "mov" }
         return "mp4"
+    }
+}
+
+public struct StagedTransferReceipt: Codable, Sendable, Equatable {
+    public let taskID: UUID
+    public let payloadFilename: String?
+    public let statusCode: Int?
+    public let contentType: String?
+    public let errorDescription: String?
+    public let photoSaved: Bool?
+
+    var hasSavedToPhotos: Bool { photoSaved == true }
+}
+
+final class StagedTransferClaim: @unchecked Sendable {
+    let receipt: StagedTransferReceipt
+    let lockURL: URL
+    private let lock = NSLock()
+    private var descriptor: Int32?
+
+    init(receipt: StagedTransferReceipt, lockURL: URL, descriptor: Int32?) {
+        self.receipt = receipt
+        self.lockURL = lockURL
+        self.descriptor = descriptor
+    }
+
+    func release() {
+        let descriptor = lock.withLock {
+            let descriptor = self.descriptor
+            self.descriptor = nil
+            return descriptor
+        }
+        #if canImport(Darwin)
+        if let descriptor {
+            _ = flock(descriptor, LOCK_UN)
+            _ = close(descriptor)
+        }
+        #endif
+    }
+
+    deinit {
+        release()
+    }
+}
+
+/// Durable per-transfer receipts stored alongside App Group payloads.
+public struct StagedTransferJournal: Sendable {
+    public let directory: URL
+
+    public init(directory: URL = BackgroundDownloadHandoff.stagingDirectory) {
+        self.directory = directory
+    }
+
+    public func record(
+        taskID: UUID,
+        payloadURL: URL?,
+        response: URLResponse?,
+        errorDescription: String?
+    ) throws {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        if let payloadURL {
+            guard payloadURL.deletingLastPathComponent().standardizedFileURL == directory.standardizedFileURL else {
+                throw CocoaError(.fileWriteInvalidFileName)
+            }
+        }
+        let http = response as? HTTPURLResponse
+        let receipt = StagedTransferReceipt(
+            taskID: taskID,
+            payloadFilename: payloadURL?.lastPathComponent,
+            statusCode: http?.statusCode,
+            contentType: http?.value(forHTTPHeaderField: "Content-Type"),
+            errorDescription: errorDescription,
+            photoSaved: false
+        )
+        let data = try JSONEncoder().encode(receipt)
+        try data.write(to: receiptURL(for: taskID), options: [.atomic])
+    }
+
+    public func markPhotoSaved(_ receipt: StagedTransferReceipt) throws {
+        let updated = StagedTransferReceipt(
+            taskID: receipt.taskID,
+            payloadFilename: receipt.payloadFilename,
+            statusCode: receipt.statusCode,
+            contentType: receipt.contentType,
+            errorDescription: receipt.errorDescription,
+            photoSaved: true
+        )
+        let data = try JSONEncoder().encode(updated)
+        try data.write(to: receiptURL(for: receipt.taskID), options: [.atomic])
+    }
+
+    public func pendingReceipts() throws -> [StagedTransferReceipt] {
+        guard FileManager.default.fileExists(atPath: directory.path) else { return [] }
+        try recoverOrphanedPayloads()
+        return try FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil
+        )
+        .filter { $0.lastPathComponent.hasSuffix(".receipt.json") }
+        .compactMap { url in
+            guard let data = try? Data(contentsOf: url) else { return nil }
+            return try? JSONDecoder().decode(StagedTransferReceipt.self, from: data)
+        }
+        .sorted { $0.taskID.uuidString < $1.taskID.uuidString }
+    }
+
+    func claimPendingReceipts() throws -> [StagedTransferClaim] {
+        let receipts = try pendingReceipts()
+        #if canImport(Darwin)
+        return receipts.compactMap { receipt in
+            let lockURL = lockURL(for: receipt.taskID)
+            let descriptor = open(
+                lockURL.path,
+                O_CREAT | O_RDWR,
+                mode_t(S_IRUSR | S_IWUSR)
+            )
+            guard descriptor >= 0 else { return nil }
+            _ = fchmod(descriptor, mode_t(S_IRUSR | S_IWUSR))
+            guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
+                _ = close(descriptor)
+                return nil
+            }
+            guard FileManager.default.fileExists(atPath: receiptURL(for: receipt.taskID).path) else {
+                _ = flock(descriptor, LOCK_UN)
+                _ = close(descriptor)
+                return nil
+            }
+            return StagedTransferClaim(
+                receipt: receipt,
+                lockURL: lockURL,
+                descriptor: descriptor
+            )
+        }
+        #else
+        return receipts.map {
+            StagedTransferClaim(receipt: $0, lockURL: lockURL(for: $0.taskID), descriptor: nil)
+        }
+        #endif
+    }
+
+    func removeLock(for claim: StagedTransferClaim) {
+        try? FileManager.default.removeItem(at: claim.lockURL)
+    }
+
+    public func payloadURL(for receipt: StagedTransferReceipt) -> URL? {
+        guard let payloadFilename = receipt.payloadFilename else { return nil }
+        return directory.appending(path: payloadFilename)
+    }
+
+    public func remove(_ receipt: StagedTransferReceipt) throws {
+        if let payloadURL = payloadURL(for: receipt), FileManager.default.fileExists(atPath: payloadURL.path) {
+            try FileManager.default.removeItem(at: payloadURL)
+        }
+        let receiptURL = receiptURL(for: receipt.taskID)
+        if FileManager.default.fileExists(atPath: receiptURL.path) {
+            try FileManager.default.removeItem(at: receiptURL)
+        }
+    }
+
+    private func recoverOrphanedPayloads() throws {
+        let contentTypes = [
+            "jpg": "image/jpeg",
+            "jpeg": "image/jpeg",
+            "png": "image/png",
+            "webp": "image/webp",
+            "heic": "image/heic",
+            "heif": "image/heif",
+            "mov": "video/quicktime",
+            "mp4": "video/mp4",
+        ]
+        let quarantineDate = Date().addingTimeInterval(-5)
+        let payloads = try FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey]
+        )
+        for payloadURL in payloads {
+            let fileExtension = payloadURL.pathExtension.lowercased()
+            guard let contentType = contentTypes[fileExtension] else { continue }
+            let stem = payloadURL.deletingPathExtension().lastPathComponent
+            guard let taskID = UUID(uuidString: stem) else { continue }
+            guard !FileManager.default.fileExists(atPath: receiptURL(for: taskID).path) else { continue }
+            let values = try payloadURL.resourceValues(forKeys: [.contentModificationDateKey, .isRegularFileKey])
+            guard values.isRegularFile == true,
+                  let modified = values.contentModificationDate,
+                  modified <= quarantineDate else { continue }
+            let response = HTTPURLResponse(
+                url: URL(string: "https://pullbox.invalid/download")!,
+                statusCode: 200,
+                httpVersion: nil,
+                headerFields: ["Content-Type": contentType]
+            )
+            try record(
+                taskID: taskID,
+                payloadURL: payloadURL,
+                response: response,
+                errorDescription: nil
+            )
+        }
+    }
+
+    private func receiptURL(for taskID: UUID) -> URL {
+        directory.appending(path: "\(taskID.uuidString).receipt.json")
+    }
+
+    private func lockURL(for taskID: UUID) -> URL {
+        directory.appending(path: "\(taskID.uuidString).receipt.lock")
     }
 }
 
@@ -309,6 +518,7 @@ public final class PullboxBackgroundSessionDelegate: NSObject, Sendable {
     private let activityManager: LiveActivityControlling
     private let photoSaver: PhotoLibrarySaving
     private let fileStager: DownloadedFileStager
+    private let transferJournal: StagedTransferJournal
     private let completionGate: BackgroundEventCompletionGate
     private let eventPipeline: BackgroundEventPipeline
 
@@ -317,6 +527,7 @@ public final class PullboxBackgroundSessionDelegate: NSObject, Sendable {
         activityManager: LiveActivityControlling = PullboxLiveActivityManager.shared,
         photoSaver: PhotoLibrarySaving = NoopPhotoSaver(),
         fileStager: DownloadedFileStager = DownloadedFileStager(),
+        transferJournal: StagedTransferJournal? = nil,
         onBackgroundEventsFinished: @escaping @Sendable () -> Void = {}
     ) {
         let completionGate = BackgroundEventCompletionGate(onComplete: onBackgroundEventsFinished)
@@ -324,9 +535,146 @@ public final class PullboxBackgroundSessionDelegate: NSObject, Sendable {
         self.activityManager = activityManager
         self.photoSaver = photoSaver
         self.fileStager = fileStager
+        self.transferJournal = transferJournal ?? StagedTransferJournal(directory: fileStager.directory)
         self.completionGate = completionGate
         self.eventPipeline = BackgroundEventPipeline(completionGate: completionGate)
         super.init()
+    }
+
+    func stageDownloadedFile(
+        taskDescription: String?,
+        response: URLResponse?,
+        location: URL
+    ) throws -> URL {
+        guard let taskDescription, let taskID = UUID(uuidString: taskDescription) else {
+            throw URLError(.badURL)
+        }
+        let stagedLocation = try fileStager.stage(
+            fileAt: location,
+            taskID: taskID,
+            response: response
+        )
+        do {
+            try transferJournal.record(
+                taskID: taskID,
+                payloadURL: stagedLocation,
+                response: response,
+                errorDescription: nil
+            )
+            return stagedLocation
+        } catch {
+            try? FileManager.default.removeItem(at: stagedLocation)
+            throw error
+        }
+    }
+
+    func recordTransportFailure(
+        taskDescription: String?,
+        response: URLResponse?,
+        error: Error
+    ) throws {
+        guard let taskDescription, let taskID = UUID(uuidString: taskDescription) else {
+            throw URLError(.badURL)
+        }
+        let existingReceipt = try transferJournal.pendingReceipts()
+            .first(where: { $0.taskID == taskID })
+        try transferJournal.record(
+            taskID: taskID,
+            payloadURL: existingReceipt.flatMap(transferJournal.payloadURL(for:)),
+            response: response,
+            errorDescription: error.localizedDescription
+        )
+    }
+
+    public func recoverPendingDownloads() async {
+        guard let claims = try? transferJournal.claimPendingReceipts() else { return }
+        for claim in claims {
+            let isTerminal = await process(receipt: claim.receipt)
+            if isTerminal {
+                try? transferJournal.remove(claim.receipt)
+            }
+            claim.release()
+            if isTerminal {
+                transferJournal.removeLock(for: claim)
+            }
+        }
+    }
+
+    private func process(receipt: StagedTransferReceipt) async -> Bool {
+        guard let item = try? store.load().first(where: { $0.id == receipt.taskID }) else {
+            return false
+        }
+        switch item.status {
+        case .succeeded, .failed:
+            return true
+        case .queued, .preparing, .downloading, .saving:
+            break
+        }
+
+        if let errorDescription = receipt.errorDescription {
+            return await persistFailure(for: item, message: errorDescription)
+        }
+        guard let statusCode = receipt.statusCode else {
+            return await persistFailure(for: item, message: "Invalid response")
+        }
+        guard 200..<300 ~= statusCode else {
+            var message = "Download failed with status \(statusCode)."
+            if let payloadURL = transferJournal.payloadURL(for: receipt),
+               let data = try? Data(contentsOf: payloadURL),
+               let server = try? JSONDecoder().decode(ServerError.self, from: data) {
+                message = server.error
+            }
+            return await persistFailure(for: item, message: message)
+        }
+        if receipt.hasSavedToPhotos {
+            do {
+                try store.update(id: item.id, status: .succeeded)
+            } catch {
+                return false
+            }
+            await activityManager.end(for: item, status: .succeeded, errorMessage: nil)
+            return true
+        }
+        guard let payloadURL = transferJournal.payloadURL(for: receipt),
+              FileManager.default.fileExists(atPath: payloadURL.path) else {
+            return await persistFailure(for: item, message: "Missing downloaded file")
+        }
+
+        do {
+            try store.update(id: item.id, status: .saving)
+        } catch {
+            return false
+        }
+        await activityManager.update(for: item, status: .saving, progress: nil, title: nil)
+
+        do {
+            try await photoSaver.save(at: payloadURL)
+            do {
+                try transferJournal.markPhotoSaved(receipt)
+            } catch {
+                return false
+            }
+        } catch {
+            return await persistFailure(for: item, message: error.localizedDescription)
+        }
+
+        do {
+            try store.update(id: item.id, status: .succeeded)
+        } catch {
+            return false
+        }
+        await activityManager.end(for: item, status: .succeeded, errorMessage: nil)
+        return true
+    }
+
+    private func persistFailure(for item: QueuedDownload, message: String) async -> Bool {
+        do {
+            try store.update(id: item.id, status: .failed(message))
+        } catch {
+            return false
+        }
+        await activityManager.end(for: item, status: .failed(message), errorMessage: message)
+        return true
     }
 
     // Exposed for testing: handle downloaded file location
@@ -408,18 +756,17 @@ extension PullboxBackgroundSessionDelegate: URLSessionDownloadDelegate {
     public func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
         let response = downloadTask.response
         let description = downloadTask.taskDescription
-        guard let description, let taskID = UUID(uuidString: description) else { return }
+        guard let description, UUID(uuidString: description) != nil else { return }
         do {
-            // CFNetwork deletes `location` when this callback returns, so the move must
-            // remain synchronous. Only processing the durable copy may be asynchronous.
-            let stagedLocation = try fileStager.stage(fileAt: location, taskID: taskID, response: response)
+            // CFNetwork deletes `location` when this callback returns, so both the move
+            // and durable receipt write must remain synchronous.
+            _ = try stageDownloadedFile(
+                taskDescription: description,
+                response: response,
+                location: location
+            )
             eventPipeline.enqueue { [self] in
-                await handleDownloadCompletion(
-                    taskDescription: description,
-                    response: response,
-                    location: stagedLocation,
-                    error: nil
-                )
+                await recoverPendingDownloads()
             }
         } catch {
             let stagingError = error
@@ -448,13 +795,25 @@ extension PullboxBackgroundSessionDelegate: URLSessionDownloadDelegate {
         if let error {
             let description = task.taskDescription
             let response = task.response
-            eventPipeline.enqueue { [self] in
-                await handleDownloadCompletion(
+            do {
+                try recordTransportFailure(
                     taskDescription: description,
                     response: response,
-                    location: nil,
                     error: error
                 )
+                eventPipeline.enqueue { [self] in
+                    await recoverPendingDownloads()
+                }
+            } catch {
+                let journalError = error
+                eventPipeline.enqueue { [self] in
+                    await handleDownloadCompletion(
+                        taskDescription: description,
+                        response: response,
+                        location: nil,
+                        error: journalError
+                    )
+                }
             }
         }
     }
@@ -465,6 +824,37 @@ extension PullboxBackgroundSessionDelegate: URLSessionDownloadDelegate {
 }
 
 private struct ServerError: Decodable { let error: String }
+
+public protocol BackgroundSessionInvalidating: AnyObject {
+    func finishTasksAndInvalidate()
+}
+
+extension URLSession: BackgroundSessionInvalidating {}
+
+/// Retains the host-side background session only while UIKit-delivered events are being drained.
+public final class BackgroundSessionOwnership: @unchecked Sendable {
+    private let lock = NSLock()
+    private var session: (any BackgroundSessionInvalidating)?
+
+    public init() {}
+
+    public var hasRetainedSession: Bool {
+        lock.withLock { session != nil }
+    }
+
+    public func retain(_ session: any BackgroundSessionInvalidating) {
+        lock.withLock { self.session = session }
+    }
+
+    public func finishAndRelease() {
+        let retainedSession = lock.withLock {
+            let retainedSession = session
+            session = nil
+            return retainedSession
+        }
+        retainedSession?.finishTasksAndInvalidate()
+    }
+}
 
 public enum PullboxBackgroundSessionCoordinator {
     public static func makeSession(

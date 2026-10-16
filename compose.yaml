@@ -5,12 +5,17 @@ services:
       dockerfile: Dockerfile
     image: pullbox:local
     container_name: pullbox
+    env_file:
+      - path: .env
+        required: false
     environment:
       PULLBOX_BIND: 0.0.0.0:8787
       PULLBOX_APNS_TOKEN_STORE_PATH: /data/live-activity-tokens.json
+      COOKIES_DIR: /cookies
       RUST_LOG: info
     volumes:
       - pullbox-data:/data
+      - ./cookies:/cookies:ro
     ports:
       - "127.0.0.1:8787:8787"
     labels:

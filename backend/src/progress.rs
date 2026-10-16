@@ -84,9 +84,13 @@ where
         let mut reader = BufReader::new(stdout);
         let mut captured_stdout = String::new();
         let mut line = String::new();
+        let mut high_water_progress: Option<f64> = None;
         while reader.read_line(&mut line).await? != 0 {
             if let Some(progress) = parse_ytdlp_progress(&line) {
-                progress_sender.send_replace(Some(progress));
+                if high_water_progress.is_none_or(|previous| progress > previous) {
+                    high_water_progress = Some(progress);
+                    progress_sender.send_replace(Some(progress));
+                }
             } else {
                 captured_stdout.push_str(&line);
             }
@@ -165,6 +169,29 @@ mod tests {
         assert_eq!(output.stdout, "/tmp/file.mp4\n");
         assert_eq!(output.stderr, "warning\n");
         assert_eq!(*values.lock().unwrap(), vec![0.45]);
+    }
+
+    #[tokio::test]
+    async fn command_runner_keeps_published_progress_monotonic_across_format_resets() {
+        let values = Arc::new(Mutex::new(Vec::new()));
+        let captured_values = values.clone();
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "printf 'PULLBOX_PROGRESS=50.0%%\\n'; sleep 0.05; printf 'PULLBOX_PROGRESS=25.0%%\\n'; sleep 0.05; printf 'PULLBOX_PROGRESS=100.0%%\\n'",
+        ]);
+
+        let output = run_command_with_progress(&mut command, move |progress| {
+            let values = captured_values.clone();
+            async move {
+                values.lock().unwrap().push(progress);
+            }
+        })
+        .await
+        .expect("command output");
+
+        assert!(output.status.success());
+        assert_eq!(*values.lock().unwrap(), vec![0.45, 0.9]);
     }
 
     #[tokio::test]

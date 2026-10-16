@@ -8,41 +8,44 @@ struct PullboxLiveActivityWidget: Widget {
     var body: some WidgetConfiguration {
         ActivityConfiguration(for: PullboxDownloadAttributes.self) { context in
             // Lock screen / banner
-            VStack(alignment: .leading, spacing: 10) {
-                HStack(spacing: 8) {
-                    Image(systemName: icon(for: context.state.status))
-                        .foregroundStyle(color(for: context.state.status))
-                    Text(title(for: context.state))
-                        .font(.headline)
-                    Spacer()
-                    if context.state.status == .downloading, let p = context.state.progress {
-                        Text("\(Int((p * 100).rounded()))%")
-                            .font(.caption.weight(.semibold))
-                            .monospacedDigit()
+            HStack(alignment: .top, spacing: 12) {
+                activityIcon(for: context.state)
+
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack(alignment: .firstTextBaseline) {
+                        Text("Pullbox")
+                            .font(.subheadline.weight(.semibold))
+                        Spacer(minLength: 8)
+                        if let progress = context.state.progress {
+                            Text("\(Int((progress * 100).rounded()))%")
+                                .font(.subheadline.weight(.bold))
+                                .monospacedDigit()
+                        }
                     }
-                }
-                if context.state.status == .downloading, let p = context.state.progress {
-                    ProgressView(value: p)
-                        .tint(Color.accentColor)
-                }
-                if let title = context.state.title, !title.isEmpty {
-                    Text(title)
-                        .font(.subheadline)
-                        .lineLimit(2)
+
+                    Text(context.state.title ?? title(for: context.state))
+                        .font(.headline)
+                        .lineLimit(1)
+
+                    if let progress = context.state.progress {
+                        ProgressView(value: progress)
+                            .tint(Color.accentColor)
+                    }
+
+                    Text(subtitle(for: context.state))
+                        .font(.caption)
                         .foregroundStyle(.secondary)
+                        .lineLimit(1)
                 }
-                Text(subtitle(for: context.state))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
             }
-            .padding(16)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 14)
             .activityBackgroundTint(Color(uiColor: .secondarySystemBackground))
             .activitySystemActionForegroundColor(Color.primary)
         } dynamicIsland: { context in
             DynamicIsland {
                 DynamicIslandExpandedRegion(.leading) {
-                    Image(systemName: icon(for: context.state.status))
-                        .foregroundStyle(color(for: context.state.status))
+                    activityIcon(for: context.state)
                 }
                 DynamicIslandExpandedRegion(.trailing) {
                     if context.state.status == .downloading, let p = context.state.progress {
@@ -54,7 +57,7 @@ struct PullboxLiveActivityWidget: Widget {
                     }
                 }
                 DynamicIslandExpandedRegion(.center) {
-                    Text(title(for: context.state))
+                    Text(context.state.title ?? title(for: context.state))
                         .font(.caption.weight(.medium))
                         .lineLimit(1)
                 }
@@ -96,6 +99,14 @@ struct PullboxLiveActivityWidget: Widget {
         case .succeeded: return "Saved"
         case .failed: return "Failed"
         }
+    }
+
+    private func activityIcon(for state: PullboxDownloadAttributes.ContentState) -> some View {
+        Image(systemName: icon(for: state.status))
+            .font(.title3.weight(.semibold))
+            .foregroundStyle(color(for: state.status))
+            .frame(width: 34, height: 34)
+            .background(color(for: state.status).opacity(0.14), in: RoundedRectangle(cornerRadius: 10))
     }
 
     private func subtitle(for state: PullboxDownloadAttributes.ContentState) -> String {

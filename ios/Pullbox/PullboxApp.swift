@@ -3,16 +3,47 @@ import PullboxCore
 import UserNotifications
 import Photos
 
+@MainActor
 class AppDelegate: NSObject, UIApplicationDelegate {
+    static weak var shared: AppDelegate?
+
     private let backgroundCompletionHandler = BackgroundEventsCompletionHandler()
-    private var backgroundSession: URLSession?
+    private let backgroundSessionOwnership = BackgroundSessionOwnership()
     private var activityPushObserver: AnyObject?
     private lazy var backgroundDelegate = PullboxBackgroundSessionDelegate(
         photoSaver: SystemPhotoLibrarySaver(),
-        onBackgroundEventsFinished: { [backgroundCompletionHandler] in
+        onBackgroundEventsFinished: {
+            [
+                backgroundCompletionHandler = backgroundCompletionHandler,
+                backgroundSessionOwnership = backgroundSessionOwnership
+            ] in
+            backgroundSessionOwnership.finishAndRelease()
             backgroundCompletionHandler.complete()
         }
     )
+    private lazy var backgroundTransferEnqueuer = SystemBackgroundTransferEnqueuer(
+        delegate: backgroundDelegate
+    )
+
+    override init() {
+        super.init()
+        Self.shared = self
+    }
+
+    func enqueueDownload(
+        sourceURL: URL,
+        title: String?,
+        baseURL: URL
+    ) async throws -> QueuedDownload {
+        try await BackgroundDownloadHandoff.enqueueAndNotify(
+            sourceURL: sourceURL,
+            title: title,
+            activityManager: PullboxLiveActivityManager.shared,
+            baseURL: baseURL,
+            remoteActivityPush: false,
+            backgroundEnqueuer: backgroundTransferEnqueuer
+        )
+    }
 
     func application(
         _ application: UIApplication,
@@ -41,7 +72,8 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         }
 
         backgroundCompletionHandler.install(completionHandler)
-        backgroundSession = PullboxBackgroundSessionCoordinator.makeSession(delegate: backgroundDelegate)
+        let session = PullboxBackgroundSessionCoordinator.makeSession(delegate: backgroundDelegate)
+        backgroundSessionOwnership.retain(session)
     }
 }
 

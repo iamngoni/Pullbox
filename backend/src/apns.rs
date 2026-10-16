@@ -16,10 +16,11 @@ use std::{
     time::Duration,
 };
 use thiserror::Error;
-use tokio::sync::Notify;
+use tokio::sync::{mpsc, watch, Notify};
 use url::Url;
 
 const MAX_DEVICE_TOKEN_HEX_LENGTH: usize = 256;
+const MAX_REGISTRY_KEY_BYTES: usize = 128;
 const MAX_ACTIVITY_TITLE_CHARACTERS: usize = 160;
 const MAX_ACTIVITY_SOURCE_URL_BYTES: usize = 1_024;
 const MAX_APNS_PAYLOAD_BYTES: usize = 4 * 1_024;
@@ -121,7 +122,7 @@ impl ApnsConfig {
         environment: Option<String>,
     ) -> Result<Option<Self>, ApnsConfigError> {
         let (team_id, key_id, private_key_pem) = match (team_id, key_id, private_key_pem) {
-            (None, None, None) => return Ok(None),
+            (None, None, None) if topic.is_none() && environment.is_none() => return Ok(None),
             (Some(team_id), Some(key_id), Some(private_key_pem))
                 if !team_id.is_empty() && !key_id.is_empty() && !private_key_pem.is_empty() =>
             {
@@ -129,10 +130,11 @@ impl ApnsConfig {
             }
             _ => return Err(ApnsConfigError::PartialCredentials),
         };
-        let environment = match environment.as_deref().unwrap_or("production") {
-            "production" => ApnsEnvironment::Production,
-            "sandbox" => ApnsEnvironment::Sandbox,
-            _ => return Err(ApnsConfigError::InvalidEnvironment),
+        let environment = match environment.as_deref() {
+            Some("production") => ApnsEnvironment::Production,
+            Some("sandbox") => ApnsEnvironment::Sandbox,
+            Some(_) => return Err(ApnsConfigError::InvalidEnvironment),
+            None => return Err(ApnsConfigError::MissingEnvironment),
         };
         let topic = topic.unwrap_or_else(|| DEFAULT_APNS_TOPIC.to_string());
         if topic.is_empty() {
@@ -414,6 +416,8 @@ pub enum ApnsConfigError {
     PartialCredentials,
     #[error("PULLBOX_APNS_ENVIRONMENT must be production or sandbox")]
     InvalidEnvironment,
+    #[error("PULLBOX_APNS_ENVIRONMENT must be set when APNs credentials are configured")]
+    MissingEnvironment,
     #[error("PULLBOX_APNS_TOPIC must not be empty")]
     EmptyTopic,
 }
@@ -440,33 +444,58 @@ impl StoredTokenMaps {
         let push_to_start = self
             .push_to_start
             .into_iter()
+            .filter(|(client_id, _)| registry_key_is_valid(client_id))
             .filter_map(|(client_id, raw)| {
                 DeviceToken::parse(&raw)
                     .ok()
                     .map(|token| (client_id, token))
             })
+            .take(DEFAULT_MAX_REGISTERED_CLIENTS)
             .collect();
         let updates = self
             .updates
             .into_iter()
+            .filter(|(client_id, _)| registry_key_is_valid(client_id))
             .filter_map(|(client_id, requests)| {
                 let requests = requests
                     .into_iter()
+                    .filter(|(request_id, _)| registry_key_is_valid(request_id))
                     .filter_map(|(request_id, raw)| {
                         DeviceToken::parse(&raw)
                             .ok()
                             .map(|token| (request_id, token))
                     })
+                    .take(DEFAULT_MAX_UPDATE_TOKENS_PER_CLIENT)
                     .collect::<HashMap<_, _>>();
                 (!requests.is_empty()).then_some((client_id, requests))
             })
+            .take(DEFAULT_MAX_REGISTERED_CLIENTS)
+            .collect();
+        let terminal_requests = self
+            .terminal_requests
+            .into_iter()
+            .filter(|(client_id, _)| registry_key_is_valid(client_id))
+            .filter_map(|(client_id, requests)| {
+                let requests = requests
+                    .into_iter()
+                    .filter(|(request_id, _)| registry_key_is_valid(request_id))
+                    .take(DEFAULT_MAX_UPDATE_TOKENS_PER_CLIENT)
+                    .collect::<HashMap<_, _>>();
+                (!requests.is_empty()).then_some((client_id, requests))
+            })
+            .take(DEFAULT_MAX_REGISTERED_CLIENTS)
             .collect();
         TokenMaps {
             push_to_start,
             updates,
-            terminal_requests: self.terminal_requests,
+            terminal_requests,
         }
     }
+}
+
+fn registry_key_is_valid(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty() && value.len() <= MAX_REGISTRY_KEY_BYTES
 }
 
 fn prune_expired_terminal_requests(maps: &mut TokenMaps, now: i64) {
@@ -476,28 +505,77 @@ fn prune_expired_terminal_requests(maps: &mut TokenMaps, now: i64) {
     });
 }
 
+const DEFAULT_MAX_REGISTERED_CLIENTS: usize = 10_000;
+const DEFAULT_MAX_UPDATE_TOKENS_PER_CLIENT: usize = 128;
+
+#[derive(Clone, Copy)]
+struct TokenRegistryLimits {
+    max_clients: usize,
+    max_updates_per_client: usize,
+}
+
+impl Default for TokenRegistryLimits {
+    fn default() -> Self {
+        Self {
+            max_clients: DEFAULT_MAX_REGISTERED_CLIENTS,
+            max_updates_per_client: DEFAULT_MAX_UPDATE_TOKENS_PER_CLIENT,
+        }
+    }
+}
+
 /// Concurrency-safe APNs token storage with optional atomic file persistence.
 #[derive(Clone)]
 pub struct TokenRegistry {
     inner: Arc<RwLock<TokenMaps>>,
     storage_path: Option<Arc<PathBuf>>,
     update_notify: Arc<Notify>,
+    limits: TokenRegistryLimits,
 }
 
 impl Default for TokenRegistry {
     fn default() -> Self {
-        Self {
-            inner: Arc::new(RwLock::new(TokenMaps::default())),
-            storage_path: None,
-            update_notify: Arc::new(Notify::new()),
-        }
+        Self::with_limits(
+            DEFAULT_MAX_REGISTERED_CLIENTS,
+            DEFAULT_MAX_UPDATE_TOKENS_PER_CLIENT,
+        )
     }
 }
 
 impl TokenRegistry {
+    /// Creates an in-memory registry with explicit capacity limits.
+    pub fn with_limits(max_clients: usize, max_updates_per_client: usize) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(TokenMaps::default())),
+            storage_path: None,
+            update_notify: Arc::new(Notify::new()),
+            limits: TokenRegistryLimits {
+                max_clients,
+                max_updates_per_client,
+            },
+        }
+    }
+
     /// Loads a registry from an owner-only file, or starts empty if it doesn't exist.
     pub fn persistent(path: impl AsRef<Path>) -> Result<Self, TokenRegistryError> {
         let path = path.as_ref().to_path_buf();
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                if !metadata.file_type().is_file() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Live Activity token store must be a regular file",
+                    )
+                    .into());
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         let (maps, existed) = match fs::read(&path) {
             Ok(bytes) => {
                 let stored: StoredTokenMaps = serde_json::from_slice(&bytes)?;
@@ -510,6 +588,7 @@ impl TokenRegistry {
             inner: Arc::new(RwLock::new(maps.clone())),
             storage_path: Some(Arc::new(path)),
             update_notify: Arc::new(Notify::new()),
+            limits: TokenRegistryLimits::default(),
         };
         if existed {
             registry.persist(&maps)?;
@@ -524,6 +603,11 @@ impl TokenRegistry {
         token: DeviceToken,
     ) -> Result<(), TokenRegistryError> {
         let mut maps = self.write();
+        if !maps.push_to_start.contains_key(client_id)
+            && maps.push_to_start.len() >= self.limits.max_clients
+        {
+            return Err(TokenRegistryError::CapacityExceeded);
+        }
         let original = maps.clone();
         maps.push_to_start.insert(client_id.to_owned(), token);
         if let Err(error) = self.persist(&maps) {
@@ -553,6 +637,23 @@ impl TokenRegistry {
                 return Err(error);
             }
             return Ok(());
+        }
+        if !maps.updates.contains_key(client_id)
+            && maps.updates.len() >= self.limits.max_clients
+        {
+            *maps = original;
+            return Err(TokenRegistryError::CapacityExceeded);
+        }
+        if maps
+            .updates
+            .get(client_id)
+            .is_some_and(|requests| {
+                !requests.contains_key(request_id)
+                    && requests.len() >= self.limits.max_updates_per_client
+            })
+        {
+            *maps = original;
+            return Err(TokenRegistryError::CapacityExceeded);
         }
         maps.updates
             .entry(client_id.to_owned())
@@ -617,17 +718,21 @@ impl TokenRegistry {
         request_id: &str,
         wait: Duration,
     ) -> Option<DeviceToken> {
-        if let Some(token) = self.update_token(client_id, request_id) {
-            return Some(token);
-        }
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            if let Some(token) = self.update_token(client_id, request_id) {
+                return Some(token);
+            }
 
-        let notified = self.update_notify.notified();
-        if let Some(token) = self.update_token(client_id, request_id) {
-            return Some(token);
-        }
+            let notified = self.update_notify.notified();
+            if let Some(token) = self.update_token(client_id, request_id) {
+                return Some(token);
+            }
 
-        let _ = actix_web::rt::time::timeout(wait, notified).await;
-        self.update_token(client_id, request_id)
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return None;
+            }
+        }
     }
 
     /// Removes a per-download token after the backend's final use and persists the change.
@@ -680,6 +785,9 @@ impl TokenRegistry {
                 use std::os::unix::fs::PermissionsExt;
                 fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
             }
+            if let Some(parent) = path.parent() {
+                fs::File::open(parent)?.sync_all()?;
+            }
             Ok::<(), TokenRegistryError>(())
         })();
         if result.is_err() {
@@ -707,6 +815,8 @@ pub enum TokenRegistryError {
     Io(#[from] io::Error),
     #[error("the Live Activity token store is invalid")]
     Json(#[from] serde_json::Error),
+    #[error("the Live Activity token registry reached its capacity")]
+    CapacityExceeded,
 }
 
 /// Correlates one download request with its client installation and ActivityKit attributes.
@@ -949,55 +1059,141 @@ impl ActivityNotifierHandle {
     }
 }
 
+/// Best-effort lifecycle events placed on a fixed-capacity control queue.
+enum NotificationLifecycleEvent {
+    Start,
+    Ready,
+    Failed(String),
+}
+
 /// Best-effort notification lifecycle for one synchronous media response.
+/// APNs delivery runs on an independent task and can never delay media processing.
 pub struct DownloadNotificationSession {
-    context: Option<ActivityNotificationContext>,
-    notifier: Option<ActivityNotifierHandle>,
+    lifecycle_sender: Option<mpsc::Sender<NotificationLifecycleEvent>>,
+    progress_sender: Option<watch::Sender<Option<f64>>>,
 }
 
 impl DownloadNotificationSession {
-    /// Starts the remote activity before any expensive download work when metadata is complete.
+    /// Queues the remote start before expensive work without awaiting APNs.
     pub async fn begin(
         context: Option<ActivityNotificationContext>,
         notifier: Option<ActivityNotifierHandle>,
     ) -> Self {
-        let session = Self { context, notifier };
-        if let (Some(context), Some(notifier)) = (&session.context, &session.notifier) {
-            if let Err(error) = notifier.0.start(context, unix_timestamp()).await {
+        let (Some(context), Some(notifier)) = (context, notifier) else {
+            return Self {
+                lifecycle_sender: None,
+                progress_sender: None,
+            };
+        };
+
+        // At most start + one terminal event can be pending. Progress is a
+        // coalescing latest-value channel, so notification memory is bounded.
+        let (lifecycle_sender, mut lifecycle_receiver) = mpsc::channel(2);
+        let (progress_sender, mut progress_receiver) = watch::channel(None::<f64>);
+        lifecycle_sender
+            .try_send(NotificationLifecycleEvent::Start)
+            .expect("new notification lifecycle queue has capacity");
+
+        actix_web::rt::spawn(async move {
+            let Some(NotificationLifecycleEvent::Start) = lifecycle_receiver.recv().await else {
+                return;
+            };
+            if let Err(error) = notifier.0.start(&context, unix_timestamp()).await {
                 log::warn!("Live Activity start was not accepted: {error}");
             }
+
+            let mut last_progress = None;
+            loop {
+                tokio::select! {
+                    lifecycle = lifecycle_receiver.recv() => {
+                        let Some(lifecycle) = lifecycle else { return; };
+                        let latest = *progress_receiver.borrow_and_update();
+                        publish_latest_progress(
+                            &notifier,
+                            &context,
+                            latest,
+                            &mut last_progress,
+                        ).await;
+                        match lifecycle {
+                            NotificationLifecycleEvent::Start => {}
+                            NotificationLifecycleEvent::Ready => {
+                                if let Err(error) = notifier.0.ready(&context, unix_timestamp()).await {
+                                    log::warn!("Live Activity server-ready update was not accepted: {error}");
+                                }
+                                return;
+                            }
+                            NotificationLifecycleEvent::Failed(message) => {
+                                if let Err(error) = notifier
+                                    .0
+                                    .failed(&context, &message, unix_timestamp())
+                                    .await
+                                {
+                                    log::warn!("Live Activity failure update was not accepted: {error}");
+                                }
+                                return;
+                            }
+                        }
+                    }
+                    changed = progress_receiver.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                        let latest = *progress_receiver.borrow_and_update();
+                        publish_latest_progress(
+                            &notifier,
+                            &context,
+                            latest,
+                            &mut last_progress,
+                        ).await;
+                    }
+                }
+            }
+        });
+
+        Self {
+            lifecycle_sender: Some(lifecycle_sender),
+            progress_sender: Some(progress_sender),
         }
-        session
     }
 
     pub async fn progress(&self, progress: f64) {
-        if let (Some(context), Some(notifier)) = (&self.context, &self.notifier) {
-            if let Err(error) = notifier
-                .0
-                .progress(context, progress, unix_timestamp())
-                .await
-            {
-                log::warn!("Live Activity progress was not accepted: {error}");
-            }
+        if let Some(sender) = &self.progress_sender {
+            sender.send_replace(Some(progress));
         }
     }
 
     /// Leaves the activity active at 0.9 for the client-owned transfer and save phases.
     pub async fn ready(&self) {
-        if let (Some(context), Some(notifier)) = (&self.context, &self.notifier) {
-            if let Err(error) = notifier.0.ready(context, unix_timestamp()).await {
-                log::warn!("Live Activity server-ready update was not accepted: {error}");
-            }
+        if let Some(sender) = &self.lifecycle_sender {
+            let _ = sender.try_send(NotificationLifecycleEvent::Ready);
         }
     }
 
     /// Ends the activity only because server-side processing failed.
     pub async fn failed(&self, message: &str) {
-        if let (Some(context), Some(notifier)) = (&self.context, &self.notifier) {
-            if let Err(error) = notifier.0.failed(context, message, unix_timestamp()).await {
-                log::warn!("Live Activity failure update was not accepted: {error}");
-            }
+        if let Some(sender) = &self.lifecycle_sender {
+            let _ = sender.try_send(NotificationLifecycleEvent::Failed(message.to_owned()));
         }
+    }
+}
+
+async fn publish_latest_progress(
+    notifier: &ActivityNotifierHandle,
+    context: &ActivityNotificationContext,
+    latest: Option<f64>,
+    last_progress: &mut Option<f64>,
+) {
+    let Some(progress) = latest else { return; };
+    if last_progress.is_some_and(|previous| progress <= previous) {
+        return;
+    }
+    *last_progress = Some(progress);
+    if let Err(error) = notifier
+        .0
+        .progress(context, progress, unix_timestamp())
+        .await
+    {
+        log::warn!("Live Activity progress was not accepted: {error}");
     }
 }
 
@@ -1069,6 +1265,15 @@ pub fn build_start_payload(activity: &ActivityDescriptor, timestamp: i64) -> Val
     }
 
     let mut bounded = activity.clone();
+    while !bounded.title.is_empty() {
+        bounded.title.pop();
+        let payload = build_start_payload_value(&bounded, timestamp);
+        if serialized_payload_fits(&payload) {
+            return payload;
+        }
+    }
+
+    bounded.title = activity.title.clone();
     bounded.source_url = activity_source_origin(&bounded.source_url);
     let mut payload = build_start_payload_value(&bounded, timestamp);
     while !serialized_payload_fits(&payload) && !bounded.title.is_empty() {
